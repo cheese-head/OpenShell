@@ -28,6 +28,15 @@ service OpenShell {
   // Delete a sandbox by name.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
+  // Create a sandbox-scoped secret.
+  rpc CreateSandboxSecret(CreateSandboxSecretRequest) returns (SandboxSecretResponse);
+
+  // List sandbox-scoped secrets.
+  rpc ListSandboxSecrets(ListSandboxSecretsRequest) returns (ListSandboxSecretsResponse);
+
+  // Delete a sandbox-scoped secret.
+  rpc DeleteSandboxSecret(DeleteSandboxSecretRequest) returns (DeleteSandboxSecretResponse);
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
 
@@ -180,6 +189,48 @@ message ListSandboxesResponse {
 
 // Delete sandbox response.
 message DeleteSandboxResponse {
+  bool deleted = 1;
+}
+
+enum SandboxSecretType {
+  SANDBOX_SECRET_TYPE_UNSPECIFIED = 0;
+  SANDBOX_SECRET_TYPE_REGISTRY = 1;
+}
+
+message SandboxSecret {
+  string name = 1;
+  string namespace = 2;
+  SandboxSecretType type = 3;
+}
+
+message CreateSandboxSecretRequest {
+  string name = 1;
+  string namespace = 2;
+  SandboxSecretType type = 3;
+  string server = 4;
+  string username = 5;
+  string password = 6;
+}
+
+message SandboxSecretResponse {
+  SandboxSecret secret = 1;
+}
+
+message ListSandboxSecretsRequest {
+  string namespace = 1;
+  SandboxSecretType type = 2;
+}
+
+message ListSandboxSecretsResponse {
+  repeated SandboxSecret secrets = 1;
+}
+
+message DeleteSandboxSecretRequest {
+  string name = 1;
+  string namespace = 2;
+}
+
+message DeleteSandboxSecretResponse {
   bool deleted = 1;
 }
 

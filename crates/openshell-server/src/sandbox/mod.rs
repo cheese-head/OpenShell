@@ -5,14 +5,16 @@
 
 use crate::persistence::{ObjectId, ObjectName, ObjectType, Store};
 use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Node, Pod};
-use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
+use k8s_openapi::ByteString;
+use k8s_openapi::api::core::v1::{Node, Pod, Secret};
+use kube::api::{Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::proto::{
-    Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus, SandboxTemplate,
+    Sandbox, SandboxCondition, SandboxPhase, SandboxSecret as ProtoSandboxSecret,
+    SandboxSecretType, SandboxSpec, SandboxStatus, SandboxTemplate,
 };
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -31,6 +33,8 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 const SANDBOX_MANAGED_LABEL: &str = "openshell.ai/managed-by";
 const SANDBOX_MANAGED_VALUE: &str = "openshell";
+const SANDBOX_SECRET_KIND_LABEL: &str = "openshell.ai/secret-kind";
+const SANDBOX_SECRET_KIND_REGISTRY: &str = "registry";
 const GPU_RUNTIME_CLASS_NAME: &str = "nvidia";
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
@@ -179,6 +183,129 @@ impl SandboxClient {
             }
             Err(KubeError::Api(err)) if err.code == 404 => Ok(None),
             Err(err) => Err(err),
+        }
+    }
+
+    pub async fn create_registry_secret(
+        &self,
+        namespace: &str,
+        name: &str,
+        server: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<ProtoSandboxSecret, KubeError> {
+        let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let auth = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        };
+        let docker_config = serde_json::json!({
+            "auths": {
+                server: {
+                    "username": username,
+                    "password": password,
+                    "auth": auth,
+                }
+            }
+        })
+        .to_string();
+
+        let secret = Secret {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(BTreeMap::from([
+                    (
+                        SANDBOX_MANAGED_LABEL.to_string(),
+                        SANDBOX_MANAGED_VALUE.to_string(),
+                    ),
+                    (
+                        SANDBOX_SECRET_KIND_LABEL.to_string(),
+                        SANDBOX_SECRET_KIND_REGISTRY.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/dockerconfigjson".to_string()),
+            data: Some(BTreeMap::from([(
+                ".dockerconfigjson".to_string(),
+                ByteString(docker_config.into_bytes()),
+            )])),
+            ..Default::default()
+        };
+
+        let patch = Patch::Apply(secret);
+        let params = PatchParams::apply("openshell-server").force();
+        let result = tokio::time::timeout(KUBE_API_TIMEOUT, api.patch(name, &params, &patch)).await;
+        match result {
+            Ok(Ok(_)) => Ok(ProtoSandboxSecret {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                r#type: SandboxSecretType::Registry as i32,
+            }),
+            Ok(Err(err)) => Err(err),
+            Err(_elapsed) => Err(KubeError::Service(Box::new(kube::error::ErrorResponse {
+                status: "Failure".to_string(),
+                message: "timed out creating registry secret".to_string(),
+                reason: "Timeout".to_string(),
+                code: 504,
+            }))),
+        }
+    }
+
+    pub async fn list_registry_secrets(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ProtoSandboxSecret>, KubeError> {
+        let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let selector = format!(
+            "{SANDBOX_MANAGED_LABEL}={SANDBOX_MANAGED_VALUE},{SANDBOX_SECRET_KIND_LABEL}={SANDBOX_SECRET_KIND_REGISTRY}"
+        );
+        let result = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.list(&ListParams::default().labels(&selector)),
+        )
+        .await;
+        match result {
+            Ok(Ok(list)) => Ok(list
+                .items
+                .into_iter()
+                .filter_map(|secret| {
+                    Some(ProtoSandboxSecret {
+                        name: secret.metadata.name?,
+                        namespace: secret
+                            .metadata
+                            .namespace
+                            .unwrap_or_else(|| namespace.to_string()),
+                        r#type: SandboxSecretType::Registry as i32,
+                    })
+                })
+                .collect()),
+            Ok(Err(err)) => Err(err),
+            Err(_elapsed) => Err(KubeError::Service(Box::new(kube::error::ErrorResponse {
+                status: "Failure".to_string(),
+                message: "timed out listing registry secrets".to_string(),
+                reason: "Timeout".to_string(),
+                code: 504,
+            }))),
+        }
+    }
+
+    pub async fn delete_secret(&self, namespace: &str, name: &str) -> Result<bool, KubeError> {
+        let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let result =
+            tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
+                .await;
+        match result {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
+            Ok(Err(err)) => Err(err),
+            Err(_elapsed) => Err(KubeError::Service(Box::new(kube::error::ErrorResponse {
+                status: "Failure".to_string(),
+                message: "timed out deleting registry secret".to_string(),
+                reason: "Timeout".to_string(),
+                code: 504,
+            }))),
         }
     }
 

@@ -23,13 +23,14 @@ use openshell_bootstrap::{
 };
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
+    CreateProviderRequest, CreateSandboxRequest, CreateSandboxSecretRequest, DeleteProviderRequest,
+    DeleteSandboxRequest, DeleteSandboxSecretRequest, GetClusterInferenceRequest,
+    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, HealthRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxSecretsRequest, ListSandboxesRequest, PolicyStatus, Provider,
+    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSecretType, SandboxSpec,
+    SandboxTemplate, SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
     UpdateProviderRequest, WatchSandboxRequest, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
@@ -40,7 +41,7 @@ use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tonic::{Code, Status};
 
@@ -1730,51 +1731,6 @@ pub fn doctor_exec(
     Ok(())
 }
 
-fn gateway_exec_output(
-    name: &str,
-    remote: Option<&str>,
-    ssh_key: Option<&str>,
-    inner_cmd: &str,
-) -> Result<Output> {
-    validate_gateway_name(name)?;
-    let container = container_name(name);
-
-    let remote_host = if let Some(dest) = remote {
-        Some(dest.to_string())
-    } else if let Some(metadata) = get_gateway_metadata(name)
-        && metadata.is_remote
-    {
-        metadata.remote_host.clone()
-    } else {
-        None
-    };
-
-    let mut cmd = if let Some(ref host) = remote_host {
-        validate_ssh_host(host)?;
-        let ssh_escaped_cmd = shell_escape(inner_cmd);
-        let mut c = Command::new("ssh");
-        if let Some(key) = ssh_key {
-            c.args(["-i", key]);
-        }
-        c.arg(host);
-        c.arg("docker");
-        c.arg("exec");
-        c.arg("-i");
-        c.args([&container, "sh", "-lc", &ssh_escaped_cmd]);
-        c
-    } else {
-        let mut c = Command::new("docker");
-        c.arg("exec");
-        c.arg("-i");
-        c.args([&container, "sh", "-lc", inner_cmd]);
-        c
-    };
-
-    cmd.output()
-        .into_diagnostic()
-        .wrap_err("failed to execute command inside the gateway container")
-}
-
 /// Print the LLM diagnostic prompt to stdout.
 ///
 /// Outputs a system prompt that a coding agent can use to autonomously
@@ -1922,42 +1878,30 @@ fn resolve_secret_value(
     ))
 }
 
-pub fn sandbox_secret_create_registry(
-    gateway_name: &str,
+pub async fn sandbox_secret_create_registry(
+    server_endpoint: &str,
     name: &str,
+    namespace: &str,
     server: &str,
     username: &str,
     password: Option<&str>,
     password_stdin: bool,
     from_env: Option<&str>,
-    namespace: &str,
-    remote: Option<&str>,
-    ssh_key: Option<&str>,
+    tls: &TlsOptions,
 ) -> Result<()> {
     let password = resolve_secret_value(password, password_stdin, from_env)?;
-    let command = format!(
-        "KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n {} create secret docker-registry {} \
---docker-server={} --docker-username={} --docker-password={} --dry-run=client -o yaml \
-| KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl label --local -f - \
-openshell.ai/managed-by=openshell openshell.ai/secret-kind=registry -o yaml \
-| KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f -",
-        shell_escape(namespace),
-        shell_escape(name),
-        shell_escape(server),
-        shell_escape(username),
-        shell_escape(&password),
-    );
-    let output = gateway_exec_output(gateway_name, remote, ssh_key, &command)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim()
-        } else {
-            stdout.trim()
-        };
-        return Err(miette!("failed to create registry secret: {detail}"));
-    }
+    let mut client = grpc_client(server_endpoint, tls).await?;
+    client
+        .create_sandbox_secret(CreateSandboxSecretRequest {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            r#type: SandboxSecretType::Registry as i32,
+            server: server.to_string(),
+            username: username.to_string(),
+            password,
+        })
+        .await
+        .into_diagnostic()?;
 
     println!(
         "{} Created registry secret '{}' in namespace '{}'",
@@ -1968,50 +1912,49 @@ openshell.ai/managed-by=openshell openshell.ai/secret-kind=registry -o yaml \
     Ok(())
 }
 
-pub fn sandbox_secret_list(
-    gateway_name: &str,
+pub async fn sandbox_secret_list(
+    server_endpoint: &str,
     namespace: &str,
-    remote: Option<&str>,
-    ssh_key: Option<&str>,
+    tls: &TlsOptions,
 ) -> Result<()> {
-    let command = format!(
-        "KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n {} get secret \
--l openshell.ai/managed-by=openshell,openshell.ai/secret-kind=registry",
-        shell_escape(namespace)
-    );
-    let output = gateway_exec_output(gateway_name, remote, ssh_key, &command)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette!(
-            "failed to list registry secrets: {}",
-            stderr.trim()
-        ));
+    let mut client = grpc_client(server_endpoint, tls).await?;
+    let response = client
+        .list_sandbox_secrets(ListSandboxSecretsRequest {
+            namespace: namespace.to_string(),
+            r#type: SandboxSecretType::Registry as i32,
+        })
+        .await
+        .into_diagnostic()?;
+    let secrets = response.into_inner().secrets;
+    if secrets.is_empty() {
+        println!("No registry secrets found in namespace '{namespace}'.");
+    } else {
+        for secret in secrets {
+            println!("{}\t{}", secret.name, secret.namespace);
+        }
     }
-    print!("{}", String::from_utf8_lossy(&output.stdout));
     Ok(())
 }
 
-pub fn sandbox_secret_delete(
-    gateway_name: &str,
+pub async fn sandbox_secret_delete(
+    server_endpoint: &str,
     name: &str,
     namespace: &str,
-    remote: Option<&str>,
-    ssh_key: Option<&str>,
+    tls: &TlsOptions,
 ) -> Result<()> {
-    let command = format!(
-        "KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n {} delete secret {}",
-        shell_escape(namespace),
-        shell_escape(name)
-    );
-    let output = gateway_exec_output(gateway_name, remote, ssh_key, &command)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette!(
-            "failed to delete registry secret: {}",
-            stderr.trim()
-        ));
+    let mut client = grpc_client(server_endpoint, tls).await?;
+    let response = client
+        .delete_sandbox_secret(DeleteSandboxSecretRequest {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    if response.into_inner().deleted {
+        println!("{} Deleted registry secret '{}'", "✓".green().bold(), name);
+    } else {
+        println!("Registry secret '{}' was not found.", name);
     }
-    print!("{}", String::from_utf8_lossy(&output.stdout));
     Ok(())
 }
 

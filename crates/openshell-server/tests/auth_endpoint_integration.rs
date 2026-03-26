@@ -522,6 +522,35 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         Err(tonic::Status::unimplemented("test"))
     }
 
+    async fn create_sandbox_secret(
+        &self,
+        _: tonic::Request<openshell_core::proto::CreateSandboxSecretRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::SandboxSecretResponse>, tonic::Status> {
+        Ok(tonic::Response::new(
+            openshell_core::proto::SandboxSecretResponse::default(),
+        ))
+    }
+
+    async fn list_sandbox_secrets(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListSandboxSecretsRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::ListSandboxSecretsResponse>, tonic::Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::ListSandboxSecretsResponse::default(),
+        ))
+    }
+
+    async fn delete_sandbox_secret(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteSandboxSecretRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::DeleteSandboxSecretResponse>, tonic::Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::DeleteSandboxSecretResponse::default(),
+        ))
+    }
+
     type WatchSandboxStream = tokio_stream::wrappers::ReceiverStream<
         Result<openshell_core::proto::SandboxStreamEvent, tonic::Status>,
     >;

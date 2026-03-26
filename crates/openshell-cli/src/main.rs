@@ -1303,14 +1303,6 @@ enum SandboxSecretCommands {
         /// Namespace where the secret lives.
         #[arg(long, default_value = "openshell")]
         namespace: String,
-
-        /// Override SSH destination for remote gateways.
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateways.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
     },
 
     /// Delete a sandbox secret by name.
@@ -1322,14 +1314,6 @@ enum SandboxSecretCommands {
         /// Namespace where the secret lives.
         #[arg(long, default_value = "openshell")]
         namespace: String,
-
-        /// Override SSH destination for remote gateways.
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateways.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
     },
 }
 
@@ -1370,14 +1354,6 @@ enum SandboxSecretCreateCommands {
         /// Namespace where the secret should be created.
         #[arg(long, default_value = "openshell")]
         namespace: String,
-
-        /// Override SSH destination for remote gateways.
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateways.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
     },
 }
 
@@ -2406,21 +2382,19 @@ async fn main() -> Result<()> {
                                     password_stdin,
                                     from_env,
                                     namespace,
-                                    remote,
-                                    ssh_key,
                                 }) => {
                                     run::sandbox_secret_create_registry(
-                                        &ctx.name,
+                                        endpoint,
                                         &name,
+                                        &namespace,
                                         &server,
                                         &username,
                                         password.as_deref(),
                                         password_stdin,
                                         from_env.as_deref(),
-                                        &namespace,
-                                        remote.as_deref(),
-                                        ssh_key.as_deref(),
-                                    )?;
+                                        &tls,
+                                    )
+                                    .await?;
                                 }
                                 None => {
                                     return Err(miette::miette!(
@@ -2428,31 +2402,12 @@ async fn main() -> Result<()> {
                                     ));
                                 }
                             },
-                            Some(SandboxSecretCommands::List {
-                                namespace,
-                                remote,
-                                ssh_key,
-                            }) => {
-                                run::sandbox_secret_list(
-                                    &ctx.name,
-                                    &namespace,
-                                    remote.as_deref(),
-                                    ssh_key.as_deref(),
-                                )?;
+                            Some(SandboxSecretCommands::List { namespace }) => {
+                                run::sandbox_secret_list(endpoint, &namespace, &tls).await?;
                             }
-                            Some(SandboxSecretCommands::Delete {
-                                name,
-                                namespace,
-                                remote,
-                                ssh_key,
-                            }) => {
-                                run::sandbox_secret_delete(
-                                    &ctx.name,
-                                    &name,
-                                    &namespace,
-                                    remote.as_deref(),
-                                    ssh_key.as_deref(),
-                                )?;
+                            Some(SandboxSecretCommands::Delete { name, namespace }) => {
+                                run::sandbox_secret_delete(endpoint, &name, &namespace, &tls)
+                                    .await?;
                             }
                             None => {
                                 return Err(miette::miette!("missing sandbox secret subcommand"));

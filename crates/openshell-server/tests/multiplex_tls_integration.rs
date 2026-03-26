@@ -165,6 +165,33 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn create_sandbox_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSandboxSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxSecretResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::SandboxSecretResponse::default(),
+        ))
+    }
+
+    async fn list_sandbox_secrets(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxSecretsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxSecretsResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ListSandboxSecretsResponse::default(),
+        ))
+    }
+
+    async fn delete_sandbox_secret(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSandboxSecretRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxSecretResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::DeleteSandboxSecretResponse::default(),
+        ))
+    }
+
     type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
     type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
 

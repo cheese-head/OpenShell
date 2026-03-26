@@ -13,25 +13,28 @@ use openshell_core::proto::setting_value;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
-    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
-    ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
+    CreateProviderRequest, CreateSandboxRequest, CreateSandboxSecretRequest,
+    CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
+    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DeleteSandboxSecretRequest, DeleteSandboxSecretResponse, DraftHistoryEntry,
+    EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting, ExecSandboxEvent,
+    ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PolicyChunk, PolicySource, PolicyStatus, Provider, ProviderResponse,
-    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse, UpdateProviderRequest,
-    WatchSandboxRequest, open_shell_server::OpenShell,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxSecretsRequest,
+    ListSandboxSecretsResponse, ListSandboxesRequest, ListSandboxesResponse, PolicyChunk,
+    PolicySource, PolicyStatus, Provider, ProviderResponse, PushSandboxLogsRequest,
+    PushSandboxLogsResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision, SandboxResponse,
+    SandboxSecretResponse, SandboxSecretType, SandboxStreamEvent, ServiceStatus, SettingScope,
+    SettingValue, SshSession, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderRequest, WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use openshell_core::proto::{
     Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
@@ -298,6 +301,92 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
         }))
+    }
+
+    async fn create_sandbox_secret(
+        &self,
+        request: Request<CreateSandboxSecretRequest>,
+    ) -> Result<Response<SandboxSecretResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        if req.r#type != SandboxSecretType::Registry as i32 {
+            return Err(Status::invalid_argument(
+                "only registry secrets are supported",
+            ));
+        }
+        if req.server.is_empty() || req.username.is_empty() || req.password.is_empty() {
+            return Err(Status::invalid_argument(
+                "server, username, and password are required for registry secrets",
+            ));
+        }
+
+        let secret = self
+            .state
+            .sandbox_client
+            .create_registry_secret(
+                &req.namespace,
+                &req.name,
+                &req.server,
+                &req.username,
+                &req.password,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("create sandbox secret failed: {e}")))?;
+
+        Ok(Response::new(SandboxSecretResponse {
+            secret: Some(secret),
+        }))
+    }
+
+    async fn list_sandbox_secrets(
+        &self,
+        request: Request<ListSandboxSecretsRequest>,
+    ) -> Result<Response<ListSandboxSecretsResponse>, Status> {
+        let req = request.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        if req.r#type != SandboxSecretType::Registry as i32 {
+            return Err(Status::invalid_argument(
+                "only registry secrets are supported",
+            ));
+        }
+
+        let secrets = self
+            .state
+            .sandbox_client
+            .list_registry_secrets(&req.namespace)
+            .await
+            .map_err(|e| Status::internal(format!("list sandbox secrets failed: {e}")))?;
+
+        Ok(Response::new(ListSandboxSecretsResponse { secrets }))
+    }
+
+    async fn delete_sandbox_secret(
+        &self,
+        request: Request<DeleteSandboxSecretRequest>,
+    ) -> Result<Response<DeleteSandboxSecretResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+
+        let deleted = self
+            .state
+            .sandbox_client
+            .delete_secret(&req.namespace, &req.name)
+            .await
+            .map_err(|e| Status::internal(format!("delete sandbox secret failed: {e}")))?;
+
+        Ok(Response::new(DeleteSandboxSecretResponse { deleted }))
     }
 
     type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
