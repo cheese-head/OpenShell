@@ -23,4 +23,12 @@ endpoints:
     protocol: rest
     access: read-write
     enforcement: enforce
-binaries: [/usr/bin/glab, /usr/local/bin/glab, /usr/bin/git, /usr/local/bin/git]
+binaries:
+  - /usr/bin/glab
+  - /usr/local/bin/glab
+  - /usr/bin/git
+  - /usr/local/bin/git
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+  - /usr/bin/node
+  - /usr/local/bin/node

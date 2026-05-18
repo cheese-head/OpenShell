@@ -60,8 +60,9 @@ pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
 pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
 
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
-    // Gateway-level opt-in for provider profile policy composition. Defaults
-    // to false when unset.
+    // Gateway-level control for provider profile policy composition. Defaults
+    // to true when unset; set false to attach provider credentials without
+    // adding the provider profile's network policy layer.
     RegisteredSetting {
         key: PROVIDERS_V2_ENABLED_KEY,
         kind: SettingValueKind::Bool,

@@ -37,8 +37,10 @@ The sandbox-local policy API is reachable at `http://policy.local`:
   already loaded a policy containing the approved rule. Use this endpoint
   instead of polling `/v1/proposals/{chunk_id}`.
 
-The proposal body takes an `intent_summary` and one or more `addRule`
-operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
+The proposal body takes an optional `human_summary`, an `intent_summary`, and
+one or more operations. Use `addRule` for network policy. Use
+`requestProvider` when the task needs an existing host-managed credential
+provider attached to the sandbox.
 
 ## Workflow
 
@@ -84,6 +86,7 @@ A complete narrow REST-inspected rule looks like this:
 
 ```json
 {
+  "human_summary": "Allow GitHub repository content writes",
   "intent_summary": "Allow gh to update repository contents in NVIDIA/OpenShell only.",
   "operations": [
     {
@@ -113,6 +116,23 @@ A complete narrow REST-inspected rule looks like this:
             }
           ]
         }
+      }
+    }
+  ]
+}
+```
+
+A provider request looks like this:
+
+```json
+{
+  "human_summary": "Attach GitHub provider",
+  "intent_summary": "Use the host-managed GitHub token to review pull requests without exposing the raw token in the sandbox.",
+  "operations": [
+    {
+      "requestProvider": {
+        "providerName": "github",
+        "providerType": "github"
       }
     }
   ]

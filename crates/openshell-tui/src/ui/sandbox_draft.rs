@@ -7,7 +7,7 @@ use crate::app::App;
 use openshell_core::proto::PolicyChunk;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
@@ -111,18 +111,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 spans.push(Span::raw("  "));
             }
 
-            // Endpoint summary (host:port).
-            let endpoint_str = chunk
-                .proposed_rule
-                .as_ref()
-                .and_then(|r| r.endpoints.first())
-                .map(|ep| format!("{}:{}", ep.host, ep.port))
-                .unwrap_or_default();
+            let headline = chunk_headline(chunk);
+            let target_str = chunk_target(chunk);
 
-            spans.push(Span::styled(&chunk.rule_name, name_style));
-            if !endpoint_str.is_empty() {
+            spans.push(Span::styled(headline, name_style));
+            if !target_str.is_empty() {
                 spans.push(Span::styled("  ", t.muted));
-                spans.push(Span::styled(endpoint_str, t.accent));
+                spans.push(Span::styled(target_str, t.accent));
             }
             // Show binary name (just the filename, not full path) if present.
             if !chunk.binary.is_empty() {
@@ -132,6 +127,19 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }
             spans.push(Span::raw("  "));
             spans.push(Span::styled(format!("[{}]", chunk.status), status_style));
+            if !chunk.validation_result.is_empty() {
+                spans.push(Span::styled("  ", t.muted));
+                spans.push(Span::styled(
+                    format!("[{}]", chunk.validation_result),
+                    validation_style(chunk, t),
+                ));
+            }
+            if chunk_has_l4_scope_warning(chunk) {
+                spans.push(Span::styled("  [L4]", t.status_warn));
+            }
+            if chunk.status == "rejected" && !chunk.rejection_reason.is_empty() {
+                spans.push(Span::styled("  guidance", t.status_err));
+            }
             spans.push(Span::styled(
                 format!("  {:.0}%", chunk.confidence * 100.0),
                 t.muted,
@@ -198,6 +206,33 @@ pub fn draw_detail_popup(
         ]),
     ];
 
+    if !chunk.human_summary.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Summary:    ", t.muted),
+            Span::styled(&chunk.human_summary, t.text),
+        ]));
+    }
+
+    if !chunk.validation_result.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Validation: ", t.muted),
+            Span::styled(&chunk.validation_result, validation_style(chunk, t)),
+        ]));
+    }
+
+    if chunk.request_type == "provider" {
+        lines.push(Line::from(vec![
+            Span::styled("Provider:   ", t.muted),
+            Span::styled(&chunk.provider_name, t.accent),
+        ]));
+        if !chunk.provider_type.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Type:       ", t.muted),
+                Span::styled(&chunk.provider_type, t.text),
+            ]));
+        }
+    }
+
     // Binary (denormalized from the denial).
     if !chunk.binary.is_empty() {
         lines.push(Line::from(vec![
@@ -232,11 +267,15 @@ pub fn draw_detail_popup(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Endpoints:", t.muted)));
         for ep in &rule.endpoints {
-            lines.push(Line::from(vec![
+            let mut endpoint_spans = vec![
                 Span::raw("  "),
                 Span::styled("-> ", t.muted),
                 Span::styled(format!("{}:{}", ep.host, ep.port), t.accent),
-            ]));
+            ];
+            if ep.protocol.is_empty() && ep.access.is_empty() && ep.rules.is_empty() {
+                endpoint_spans.push(Span::styled("  L4 only", t.status_warn));
+            }
+            lines.push(Line::from(endpoint_spans));
         }
 
         // Binaries.
@@ -252,8 +291,13 @@ pub fn draw_detail_popup(
         }
     }
 
-    // Rationale.
-    if !chunk.rationale.is_empty() {
+    if !chunk.intent_summary.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Intent:     ", t.muted),
+            Span::styled(&chunk.intent_summary, t.text),
+        ]));
+    } else if !chunk.rationale.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("Rationale:  ", t.muted),
@@ -268,6 +312,22 @@ pub fn draw_detail_popup(
             format!("! {}", chunk.security_notes),
             t.status_warn.add_modifier(Modifier::BOLD),
         )]));
+    }
+
+    if chunk_has_l4_scope_warning(chunk) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "! L4-only request: this allows host/port reachability without HTTP method or path scoping.",
+            t.status_warn.add_modifier(Modifier::BOLD),
+        )]));
+    }
+
+    if chunk.status == "rejected" && !chunk.rejection_reason.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Guidance:   ", t.status_err.add_modifier(Modifier::BOLD)),
+            Span::styled(&chunk.rejection_reason, t.text),
+        ]));
     }
 
     // Action hints — state-aware toggle keys.
@@ -427,6 +487,51 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let mut out: String = s.chars().take(max_len - 3).collect();
         out.push_str("...");
         out
+    }
+}
+
+fn chunk_headline(chunk: &PolicyChunk) -> &str {
+    if chunk.human_summary.is_empty() {
+        &chunk.rule_name
+    } else {
+        &chunk.human_summary
+    }
+}
+
+fn chunk_target(chunk: &PolicyChunk) -> String {
+    if chunk.request_type == "provider" {
+        if chunk.provider_name.is_empty() {
+            return String::new();
+        }
+        if chunk.provider_type.is_empty() {
+            return format!("provider {}", chunk.provider_name);
+        }
+        return format!("provider {} ({})", chunk.provider_name, chunk.provider_type);
+    }
+    chunk
+        .proposed_rule
+        .as_ref()
+        .and_then(|r| r.endpoints.first())
+        .map(|ep| format!("{}:{}", ep.host, ep.port))
+        .unwrap_or_default()
+}
+
+fn chunk_has_l4_scope_warning(chunk: &PolicyChunk) -> bool {
+    chunk.proposed_rule.as_ref().is_some_and(|rule| {
+        rule.endpoints
+            .iter()
+            .any(|ep| ep.protocol.is_empty() && ep.access.is_empty() && ep.rules.is_empty())
+    })
+}
+
+fn validation_style(chunk: &PolicyChunk, theme: &crate::theme::Theme) -> Style {
+    let value = chunk.validation_result.to_ascii_lowercase();
+    if value.contains("fail") || value.contains("error") || value.contains("deny") {
+        theme.status_err
+    } else if value.contains("warn") || value.contains("l4") {
+        theme.status_warn
+    } else {
+        theme.status_ok
     }
 }
 

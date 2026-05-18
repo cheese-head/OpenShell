@@ -1305,6 +1305,17 @@ message PolicyChunk {
   // back to the in-sandbox agent so it can revise the proposal.
   // Empty for non-rejected chunks.
   string rejection_reason = 18;
+  // Human-readable proposal headline for inbox display.
+  string human_summary = 19;
+  // Agent-supplied intent context for inbox display.
+  string intent_summary = 20;
+  // Proposal kind. Empty and "network_policy" mean proposed_rule is merged.
+  // "provider" means approval attaches provider_name to the sandbox.
+  string request_type = 21;
+  // Existing provider record requested by a provider proposal.
+  string provider_name = 22;
+  // Optional expected provider type, used for display and validation hints.
+  string provider_type = 23;
 }
 
 // Notification that the draft policy was updated.
@@ -1516,6 +1527,16 @@ message DraftChunkPayload {
   // Operator-supplied free-form rejection text; empty for non-rejected
   // chunks. Mirrors PolicyChunk.rejection_reason.
   string rejection_reason = 12;
+  // Mirrors PolicyChunk.human_summary.
+  string human_summary = 13;
+  // Mirrors PolicyChunk.intent_summary.
+  string intent_summary = 14;
+  // Mirrors PolicyChunk.request_type.
+  string request_type = 15;
+  // Mirrors PolicyChunk.provider_name.
+  string provider_name = 16;
+  // Mirrors PolicyChunk.provider_type.
+  string provider_type = 17;
 }
 
 // Internal stored policy revision row materialized from the generic objects table.
@@ -1554,4 +1575,14 @@ message StoredDraftChunk {
   string validation_result = 18;
   // Operator-supplied free-form rejection text. See PolicyChunk.
   string rejection_reason = 19;
+  // Human-readable proposal headline. See PolicyChunk.
+  string human_summary = 20;
+  // Agent-supplied intent context. See PolicyChunk.
+  string intent_summary = 21;
+  // Proposal kind. See PolicyChunk.
+  string request_type = 22;
+  // Existing provider record requested by a provider proposal. See PolicyChunk.
+  string provider_name = 23;
+  // Optional expected provider type. See PolicyChunk.
+  string provider_type = 24;
 }

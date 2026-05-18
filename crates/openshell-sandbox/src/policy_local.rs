@@ -9,6 +9,7 @@ use openshell_core::proto::{
     SandboxPolicy as ProtoSandboxPolicy,
 };
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+use openshell_providers::get_default_profile;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ pub const SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
 pub const ROUTE_POLICY_CURRENT: &str = "/v1/policy/current";
 pub const ROUTE_DENIALS: &str = "/v1/denials";
 pub const ROUTE_PROPOSALS: &str = "/v1/proposals";
+pub const ROUTE_PROVIDERS: &str = "/v1/providers";
 /// Per-proposal status and long-poll routes live below this prefix:
 ///   `GET /v1/proposals/{chunk_id}`              — immediate status
 ///   `GET /v1/proposals/{chunk_id}/wait?timeout` — long-poll until terminal
@@ -154,6 +156,7 @@ async fn route_request(
     match (method, route) {
         ("GET", ROUTE_POLICY_CURRENT) => current_policy_response(ctx).await,
         ("GET", ROUTE_DENIALS) => recent_denials_response(ctx, query).await,
+        ("GET", ROUTE_PROVIDERS) => attached_providers_response(ctx).await,
         ("POST", ROUTE_PROPOSALS) => submit_proposal(ctx, body).await,
         ("GET", path) if path.starts_with(ROUTE_PROPOSALS_PREFIX) => {
             proposal_state_route(ctx, path, query).await
@@ -232,6 +235,11 @@ pub fn agent_next_steps() -> serde_json::Value {
             "action": "inspect_recent_denials",
             "method": "GET",
             "url": format!("http://{host}{ROUTE_DENIALS}?last=5"),
+        },
+        {
+            "action": "inspect_attached_providers",
+            "method": "GET",
+            "url": format!("http://{host}{ROUTE_PROVIDERS}"),
         },
         {
             "action": "submit_proposal",
@@ -667,7 +675,7 @@ async fn proposal_status_response(
         Ok(session) => session,
         Err(err) => return err,
     };
-    fetch_chunk_or_404(&session, chunk_id, false).await
+    fetch_chunk_or_404(ctx, &session, chunk_id, false).await
 }
 
 /// `GET /v1/proposals/{chunk_id}/wait?timeout=<s>` — block until terminal or
@@ -749,16 +757,118 @@ fn chunk_not_found_payload(chunk_id: &str) -> (u16, serde_json::Value) {
     )
 }
 
+async fn attached_providers_response(ctx: &PolicyLocalContext) -> (u16, serde_json::Value) {
+    let session = match open_lookup_session(ctx).await {
+        Ok(session) => session,
+        Err(err) => return err,
+    };
+    let providers = match session
+        .client
+        .list_sandbox_providers(session.sandbox_name)
+        .await
+    {
+        Ok(providers) => providers,
+        Err(e) => return (502, error_payload("gateway_lookup_failed", e.to_string())),
+    };
+
+    let providers = providers
+        .into_iter()
+        .map(|provider| {
+            let mut credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
+            let mut config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
+            credential_keys.sort();
+            config_keys.sort();
+            serde_json::json!({
+                "provider_name": provider
+                    .metadata
+                    .as_ref()
+                    .map(|meta| meta.name.clone())
+                    .unwrap_or_default(),
+                "provider_type": provider.r#type,
+                "credential_keys": credential_keys,
+                "config_keys": config_keys,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    (200, serde_json::json!({ "providers": providers }))
+}
+
 async fn fetch_chunk_or_404(
+    ctx: &PolicyLocalContext,
     session: &LookupSession<'_>,
     chunk_id: &str,
     timed_out: bool,
 ) -> (u16, serde_json::Value) {
     match fetch_chunk(session, chunk_id).await {
-        Ok(Some(chunk)) => (200, chunk_state_payload(&chunk, timed_out, false)),
+        Ok(Some(chunk)) => {
+            let policy_reloaded = chunk_applied_locally(ctx, session, &chunk).await;
+            (200, chunk_state_payload(&chunk, timed_out, policy_reloaded))
+        }
         Ok(None) => chunk_not_found_payload(chunk_id),
         Err(err) => err,
     }
+}
+
+async fn chunk_applied_locally(
+    ctx: &PolicyLocalContext,
+    session: &LookupSession<'_>,
+    chunk: &PolicyChunk,
+) -> bool {
+    if chunk.status != "approved" {
+        return false;
+    }
+    if chunk.request_type == "provider" {
+        let provider_name = chunk.provider_name.trim();
+        if provider_name.is_empty() {
+            return true;
+        }
+        let attached = match session
+            .client
+            .list_sandbox_providers(session.sandbox_name)
+            .await
+        {
+            Ok(providers) => providers.into_iter().find(|provider| {
+                provider
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|meta| meta.name.trim().eq_ignore_ascii_case(provider_name))
+            }),
+            Err(_) => return false,
+        };
+        let Some(attached) = attached else {
+            return false;
+        };
+
+        let Some(profile) = get_default_profile(attached.r#type.trim()) else {
+            return true;
+        };
+        let Some(attached_name) = attached
+            .metadata
+            .as_ref()
+            .map(|meta| meta.name.trim())
+            .filter(|name| !name.is_empty())
+        else {
+            return true;
+        };
+        let snapshot = ctx.current_policy.read().await.clone();
+        let Some(policy) = snapshot.as_ref() else {
+            return false;
+        };
+        let provider_rule_name = openshell_policy::provider_rule_name(attached_name);
+        if policy.network_policies.contains_key(&provider_rule_name) {
+            return true;
+        }
+        let provider_rule = profile.network_policy_rule(&provider_rule_name);
+        return openshell_policy::policy_covers_rule(policy, &provider_rule);
+    }
+    let Some(rule) = chunk.proposed_rule.as_ref() else {
+        return false;
+    };
+    let snapshot = ctx.current_policy.read().await.clone();
+    snapshot
+        .as_ref()
+        .is_some_and(|policy| openshell_policy::policy_covers_rule(policy, rule))
 }
 
 /// Build the agent-facing response for a chunk.
@@ -782,6 +892,9 @@ fn chunk_state_payload(
         "status": chunk.status,
         "rule_name": chunk.rule_name,
         "binary": chunk.binary,
+        "request_type": chunk.request_type,
+        "provider_name": chunk.provider_name,
+        "provider_type": chunk.provider_type,
         "rejection_reason": chunk.rejection_reason,
         "validation_result": chunk.validation_result,
     });
@@ -931,18 +1044,27 @@ fn proposal_chunks_from_body(body: &[u8]) -> std::result::Result<Vec<PolicyChunk
 
     let mut chunks = Vec::new();
     for operation in request.operations {
-        let Some(add_rule) = operation.get("addRule").cloned() else {
+        if let Some(add_rule) = operation.get("addRule").cloned() {
+            let add_rule: AddNetworkRuleJson =
+                serde_json::from_value(add_rule).map_err(|e| e.to_string())?;
+            chunks.push(policy_chunk_from_add_rule(
+                add_rule,
+                request.human_summary.as_deref(),
+                request.intent_summary.as_deref().unwrap_or_default(),
+            )?);
+        } else if let Some(provider_request) = operation.get("requestProvider").cloned() {
+            let provider_request: RequestProviderJson =
+                serde_json::from_value(provider_request).map_err(|e| e.to_string())?;
+            chunks.push(policy_chunk_from_provider_request(
+                provider_request,
+                request.human_summary.as_deref(),
+                request.intent_summary.as_deref().unwrap_or_default(),
+            )?);
+        } else {
             return Err(
-                "this MVP accepts `addRule` operations; submit a full narrow NetworkPolicyRule"
-                    .to_string(),
+                "proposal operations must contain `addRule` or `requestProvider`".to_string(),
             );
-        };
-        let add_rule: AddNetworkRuleJson =
-            serde_json::from_value(add_rule).map_err(|e| e.to_string())?;
-        chunks.push(policy_chunk_from_add_rule(
-            add_rule,
-            request.intent_summary.as_deref().unwrap_or_default(),
-        )?);
+        }
     }
 
     Ok(chunks)
@@ -950,6 +1072,7 @@ fn proposal_chunks_from_body(body: &[u8]) -> std::result::Result<Vec<PolicyChunk
 
 fn policy_chunk_from_add_rule(
     add_rule: AddNetworkRuleJson,
+    human_summary: Option<&str>,
     intent_summary: &str,
 ) -> std::result::Result<PolicyChunk, String> {
     let mut rule = network_rule_from_json(add_rule.rule)?;
@@ -971,6 +1094,11 @@ fn policy_chunk_from_add_rule(
         .first()
         .map(|binary| binary.path.clone())
         .unwrap_or_default();
+    let headline = human_summary
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .unwrap_or(&rule_name)
+        .to_string();
 
     Ok(PolicyChunk {
         id: String::new(),
@@ -991,6 +1119,66 @@ fn policy_chunk_from_add_rule(
         binary,
         validation_result: String::new(),
         rejection_reason: String::new(),
+        human_summary: headline,
+        intent_summary: intent_summary.to_string(),
+        request_type: "network_policy".to_string(),
+        provider_name: String::new(),
+        provider_type: String::new(),
+    })
+}
+
+fn policy_chunk_from_provider_request(
+    request: RequestProviderJson,
+    human_summary: Option<&str>,
+    intent_summary: &str,
+) -> std::result::Result<PolicyChunk, String> {
+    let provider_name = request.provider_name.trim();
+    if provider_name.is_empty() {
+        return Err("requestProvider.providerName is required".to_string());
+    }
+    let provider_type = request.provider_type.unwrap_or_default();
+    let provider_type = provider_type.trim();
+    let rule_name = request
+        .rule_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map_or_else(
+            || format!("request_provider_{}", provider_name.replace('-', "_")),
+            ToString::to_string,
+        );
+    let headline = human_summary
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .map_or_else(
+            || format!("Attach provider {provider_name}"),
+            ToString::to_string,
+        );
+
+    Ok(PolicyChunk {
+        id: String::new(),
+        status: "pending".to_string(),
+        rule_name,
+        proposed_rule: None,
+        rationale: intent_summary.to_string(),
+        security_notes: String::new(),
+        confidence: 0.75,
+        denial_summary_ids: vec![],
+        created_at_ms: 0,
+        decided_at_ms: 0,
+        stage: "agent".to_string(),
+        supersedes_chunk_id: String::new(),
+        hit_count: 1,
+        first_seen_ms: 0,
+        last_seen_ms: 0,
+        binary: String::new(),
+        validation_result: String::new(),
+        rejection_reason: String::new(),
+        human_summary: headline,
+        intent_summary: intent_summary.to_string(),
+        request_type: "provider".to_string(),
+        provider_name: provider_name.to_string(),
+        provider_type: provider_type.to_string(),
     })
 }
 
@@ -1209,6 +1397,8 @@ fn error_payload(error: &str, detail: String) -> serde_json::Value {
 #[derive(Debug, Deserialize)]
 struct ProposalRequest {
     #[serde(default)]
+    human_summary: Option<String>,
+    #[serde(default)]
     intent_summary: Option<String>,
     #[serde(default)]
     operations: Vec<serde_json::Value>,
@@ -1219,6 +1409,16 @@ struct AddNetworkRuleJson {
     #[serde(default, rename = "ruleName")]
     rule_name: Option<String>,
     rule: NetworkPolicyRuleJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestProviderJson {
+    #[serde(default, rename = "ruleName")]
+    rule_name: Option<String>,
+    #[serde(rename = "providerName")]
+    provider_name: String,
+    #[serde(default, rename = "providerType")]
+    provider_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1293,6 +1493,7 @@ mod tests {
     #[test]
     fn proposal_chunks_from_body_accepts_add_rule_operation() {
         let body = br#"{
+            "human_summary": "Allow GitHub repo creation",
             "intent_summary": "Allow gh to create one repo.",
             "operations": [
                 {
@@ -1331,6 +1532,9 @@ mod tests {
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].rule_name, "github_api_repo_create");
+        assert_eq!(chunks[0].human_summary, "Allow GitHub repo creation");
+        assert_eq!(chunks[0].intent_summary, "Allow gh to create one repo.");
+        assert_eq!(chunks[0].request_type, "network_policy");
         assert_eq!(chunks[0].rationale, "Allow gh to create one repo.");
         assert_eq!(chunks[0].binary, "/usr/bin/gh");
         let rule = chunks[0].proposed_rule.as_ref().unwrap();
@@ -1343,6 +1547,35 @@ mod tests {
             rule.endpoints[0].rules[0].allow.as_ref().unwrap().path,
             "/user/repos"
         );
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_accepts_provider_request_operation() {
+        let body = br#"{
+            "human_summary": "Attach GitHub provider",
+            "intent_summary": "Review pull requests with the host-managed GitHub token.",
+            "operations": [
+                {
+                    "requestProvider": {
+                        "providerName": "github",
+                        "providerType": "github"
+                    }
+                }
+            ]
+        }"#;
+
+        let chunks = proposal_chunks_from_body(body).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].request_type, "provider");
+        assert_eq!(chunks[0].provider_name, "github");
+        assert_eq!(chunks[0].provider_type, "github");
+        assert_eq!(chunks[0].human_summary, "Attach GitHub provider");
+        assert_eq!(
+            chunks[0].intent_summary,
+            "Review pull requests with the host-managed GitHub token."
+        );
+        assert!(chunks[0].proposed_rule.is_none());
     }
 
     #[test]
@@ -1558,12 +1791,13 @@ mod tests {
         let _guard = ProposalsFlagGuard::set_blocking(true);
         let steps = agent_next_steps();
         let arr = steps.as_array().expect("agent_next_steps is an array");
-        assert_eq!(arr.len(), 4, "expected 4 next_steps when feature is on");
+        assert_eq!(arr.len(), 5, "expected 5 next_steps when feature is on");
         let actions: Vec<&str> = arr
             .iter()
             .filter_map(|v| v.get("action").and_then(serde_json::Value::as_str))
             .collect();
         assert!(actions.contains(&"read_skill"));
+        assert!(actions.contains(&"inspect_attached_providers"));
         assert!(actions.contains(&"submit_proposal"));
     }
 
@@ -1732,6 +1966,16 @@ mod tests {
 
         let (status, body) =
             route_request(&ctx, "GET", "/v1/proposals/chunk-id/wait?timeout=1", &[]).await;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"], "gateway_unavailable");
+    }
+
+    #[tokio::test]
+    async fn providers_route_returns_503_when_no_gateway() {
+        let _guard = ProposalsFlagGuard::set(true).await;
+        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+
+        let (status, body) = route_request(&ctx, "GET", "/v1/providers", &[]).await;
         assert_eq!(status, 503);
         assert_eq!(body["error"], "gateway_unavailable");
     }

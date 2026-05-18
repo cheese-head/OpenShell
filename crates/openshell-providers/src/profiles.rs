@@ -880,7 +880,19 @@ mod tests {
             ProviderProfileCategory::SourceControl as i32
         );
         assert_eq!(proto.endpoints.len(), 2);
-        assert_eq!(proto.binaries.len(), 4);
+        assert_eq!(proto.binaries.len(), 8);
+        assert!(
+            proto
+                .binaries
+                .iter()
+                .any(|binary| binary.path == "/usr/bin/curl")
+        );
+        assert!(
+            proto
+                .binaries
+                .iter()
+                .any(|binary| binary.path == "/usr/local/bin/node")
+        );
     }
 
     #[test]

@@ -365,6 +365,11 @@ pub fn draft_chunk_payload_from_record(chunk: &DraftChunkRecord) -> PersistenceR
         draft_version: chunk.draft_version,
         validation_result: chunk.validation_result.clone(),
         rejection_reason: chunk.rejection_reason.clone(),
+        human_summary: chunk.human_summary.clone(),
+        intent_summary: chunk.intent_summary.clone(),
+        request_type: chunk.request_type.clone(),
+        provider_name: chunk.provider_name.clone(),
+        provider_type: chunk.provider_type.clone(),
     }
     .encode_to_vec())
 }
@@ -407,5 +412,10 @@ pub fn draft_chunk_record_from_parts(
         last_seen_ms: updated_at_ms,
         validation_result: wrapper.validation_result,
         rejection_reason: wrapper.rejection_reason,
+        human_summary: wrapper.human_summary,
+        intent_summary: wrapper.intent_summary,
+        request_type: wrapper.request_type,
+        provider_name: wrapper.provider_name,
+        provider_type: wrapper.provider_type,
     })
 }

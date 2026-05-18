@@ -18,6 +18,7 @@ path = "src/main.rs"
 openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
 
 # Async runtime

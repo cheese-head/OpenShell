@@ -3584,6 +3584,7 @@ dependencies = [
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-providers",
  "openshell-router",
  "rand_core 0.6.4",
  "rcgen",

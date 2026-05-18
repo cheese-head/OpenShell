@@ -2332,7 +2332,13 @@ mod tests {
             body["next_steps"][0]["path"],
             "/etc/openshell/skills/policy_advisor.md"
         );
-        assert_eq!(body["next_steps"][3]["body_type"], "PolicyMergeOperation");
+        let submit_step = body["next_steps"]
+            .as_array()
+            .expect("next_steps should be an array")
+            .iter()
+            .find(|step| step["action"] == "submit_proposal")
+            .expect("next_steps should include submit_proposal");
+        assert_eq!(submit_step["body_type"], "PolicyMergeOperation");
         assert!(
             !body.to_string().contains("secret-token"),
             "deny body must not leak query params or credential values"

@@ -55,13 +55,12 @@ openshell provider create --name my-api --type generic --credential API_KEY
 This looks up the current value of `$API_KEY` in your shell and stores it.
 
 Provider profile metadata is available for known provider types. Provider profile
-network policy is gateway opt-in:
+network policy is enabled by default. To attach provider credentials without
+adding provider profile network policy layers, disable it:
 
 ```shell
-openshell settings set --global --key providers_v2_enabled --value true
+openshell settings set --global --key providers_v2_enabled --value false
 ```
-
-Without `providers_v2_enabled=true`, provider behavior remains credential-only.
 
 ## Manage Providers
 
@@ -101,14 +100,13 @@ openshell sandbox create --provider my-claude --provider my-github -- claude
 
 Each `--provider` flag attaches one provider. The sandbox receives all
 credentials from every attached provider at runtime. Profile-managed providers
-also contribute provider-generated network policy entries when
-`providers_v2_enabled` is enabled at the gateway. When the setting is disabled,
-providers keep the previous behavior and only provide credentials.
+also contribute provider-generated network policy entries unless
+`providers_v2_enabled` is disabled at the gateway. When the setting is disabled,
+providers only provide credentials.
 
 <Warning>
-Providers cannot be added to a running sandbox. If you need to attach an
-additional provider, delete the sandbox and recreate it with all required
-providers specified.
+Provider attachment changes on a running sandbox require operator approval and
+are applied through the draft policy workflow.
 
 </Warning>
 

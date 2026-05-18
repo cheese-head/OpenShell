@@ -212,6 +212,7 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
         let stage = denials
             .first()
             .map_or_else(|| "connect".to_string(), |d| d.denial_stage.clone());
+        let human_summary = rule_name.clone();
 
         proposals.push(PolicyChunk {
             id: String::new(), // Assigned by the gateway on persist
@@ -232,6 +233,11 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             binary: binary.clone(),
             validation_result: String::new(),
             rejection_reason: String::new(),
+            human_summary,
+            intent_summary: String::new(),
+            request_type: "network_policy".to_string(),
+            provider_name: String::new(),
+            provider_type: String::new(),
         });
     }
 

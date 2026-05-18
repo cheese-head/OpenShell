@@ -10,6 +10,8 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
+use super::provider::get_provider_record;
+use super::validation::validate_sandbox_spec;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
 use crate::{ServerState, auth::oidc};
@@ -49,7 +51,7 @@ use openshell_policy::{
 use openshell_providers::{get_default_profile, normalize_provider_type};
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -58,7 +60,9 @@ use tracing::{debug, info, warn};
 use super::validation::{
     level_matches, source_matches, validate_policy_safety, validate_static_fields_unchanged,
 };
-use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit, current_time_ms};
+use super::{
+    MAX_PAGE_SIZE, MAX_PROVIDERS, StoredSettingValue, StoredSettings, clamp_limit, current_time_ms,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -585,6 +589,7 @@ async fn profile_provider_policy_layers(
 
 fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
     match settings.settings.get(key) {
+        None if key == settings::PROVIDERS_V2_ENABLED_KEY => Ok(true),
         None => Ok(false),
         Some(StoredSettingValue::Bool(value)) => Ok(*value),
         Some(_) => Err(Status::internal(format!(
@@ -1331,6 +1336,123 @@ pub(super) async fn handle_push_sandbox_logs(
 // Draft policy recommendation handlers
 // ---------------------------------------------------------------------------
 
+fn normalize_draft_request_type(request_type: &str) -> String {
+    match request_type.trim() {
+        "" | "network_policy" => "network_policy".to_string(),
+        "provider" => "provider".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn is_provider_request_chunk(chunk: &DraftChunkRecord) -> bool {
+    normalize_draft_request_type(&chunk.request_type) == "provider"
+}
+
+fn summarize_provider_request_chunk(chunk: &DraftChunkRecord) -> Result<String, Status> {
+    if chunk.provider_name.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "provider request missing provider_name",
+        ));
+    }
+    let provider_type = if chunk.provider_type.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" type={}", chunk.provider_type)
+    };
+    Ok(format!(
+        "attach-provider {}{provider_type}",
+        chunk.provider_name
+    ))
+}
+
+async fn approve_provider_request_chunk(
+    state: &Arc<ServerState>,
+    sandbox_name: &str,
+    chunk: &DraftChunkRecord,
+) -> Result<bool, Status> {
+    let provider_name = chunk.provider_name.trim();
+    if provider_name.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider request missing provider_name",
+        ));
+    }
+
+    let provider = get_provider_record(state.store.as_ref(), provider_name)
+        .await
+        .map_err(|err| {
+            if err.code() == tonic::Code::NotFound {
+                Status::failed_precondition(format!("provider '{provider_name}' not found"))
+            } else {
+                err
+            }
+        })?;
+    if !chunk.provider_type.trim().is_empty() && provider.r#type != chunk.provider_type.trim() {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider_name}' has type '{}', expected '{}'",
+            provider.r#type,
+            chunk.provider_type.trim()
+        )));
+    }
+
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let mut sandbox = state
+        .store
+        .get_message_by_name::<Sandbox>(sandbox_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let spec = sandbox
+        .spec
+        .as_mut()
+        .ok_or_else(|| Status::failed_precondition("sandbox spec is missing"))?;
+
+    dedupe_strings(&mut spec.providers);
+    let attached = if spec.providers.iter().any(|name| name == provider_name) {
+        false
+    } else {
+        if spec.providers.len() >= MAX_PROVIDERS {
+            return Err(Status::invalid_argument(format!(
+                "providers list exceeds maximum ({MAX_PROVIDERS})"
+            )));
+        }
+        spec.providers.push(provider_name.to_string());
+        true
+    };
+    validate_sandbox_spec(sandbox_name, spec)?;
+
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
+
+    info!(
+        sandbox_name,
+        provider_name, attached, "ApproveDraftChunk: provider request attached provider"
+    );
+    Ok(attached)
+}
+
+async fn current_sandbox_policy_marker(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<(i64, String), Status> {
+    let config = handle_get_sandbox_config(
+        state,
+        Request::new(GetSandboxConfigRequest {
+            sandbox_id: sandbox_id.to_string(),
+        }),
+    )
+    .await?
+    .into_inner();
+    Ok((i64::from(config.version), config.policy_hash))
+}
+
+fn dedupe_strings(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
 pub(super) async fn handle_submit_policy_analysis(
     state: &Arc<ServerState>,
     request: Request<SubmitPolicyAnalysisRequest>,
@@ -1361,14 +1483,28 @@ pub(super) async fn handle_submit_policy_analysis(
     let mut accepted_chunk_ids: Vec<String> = Vec::new();
 
     for chunk in &req.proposed_chunks {
+        let request_type = normalize_draft_request_type(&chunk.request_type);
         if chunk.rule_name.is_empty() {
             rejected += 1;
             rejection_reasons.push("chunk missing rule_name".to_string());
             continue;
         }
-        if chunk.proposed_rule.is_none() {
+        if request_type == "network_policy" && chunk.proposed_rule.is_none() {
             rejected += 1;
             rejection_reasons.push(format!("chunk '{}' missing proposed_rule", chunk.rule_name));
+            continue;
+        }
+        if request_type == "provider" && chunk.provider_name.trim().is_empty() {
+            rejected += 1;
+            rejection_reasons.push(format!("chunk '{}' missing provider_name", chunk.rule_name));
+            continue;
+        }
+        if request_type != "network_policy" && request_type != "provider" {
+            rejected += 1;
+            rejection_reasons.push(format!(
+                "chunk '{}' has unsupported request_type '{}'",
+                chunk.rule_name, chunk.request_type
+            ));
             continue;
         }
 
@@ -1424,6 +1560,15 @@ pub(super) async fn handle_submit_policy_analysis(
             },
             validation_result: String::new(),
             rejection_reason: String::new(),
+            human_summary: chunk.human_summary.clone(),
+            intent_summary: if chunk.intent_summary.is_empty() {
+                chunk.rationale.clone()
+            } else {
+                chunk.intent_summary.clone()
+            },
+            request_type,
+            provider_name: chunk.provider_name.trim().to_string(),
+            provider_type: chunk.provider_type.trim().to_string(),
         };
         // Mechanistic mode dedups N denials targeting the same endpoint
         // into one chunk. All other modes (agent-authored proposals, future
@@ -1562,12 +1707,20 @@ pub(super) async fn handle_approve_draft_chunk(
         port = chunk.port,
         hit_count = chunk.hit_count,
         prev_status = %chunk.status,
-        "ApproveDraftChunk: merging rule into active policy"
+        request_type = %normalize_draft_request_type(&chunk.request_type),
+        "ApproveDraftChunk: approving draft chunk"
     );
 
-    let (version, hash) =
-        merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &chunk).await?;
-    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
+    let (version, hash, chunk_summary) = if is_provider_request_chunk(&chunk) {
+        approve_provider_request_chunk(state, sandbox.object_name(), &chunk).await?;
+        let (version, hash) = current_sandbox_policy_marker(state, &sandbox_id).await?;
+        (version, hash, summarize_provider_request_chunk(&chunk)?)
+    } else {
+        let (version, hash) =
+            merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &chunk).await?;
+        let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
+        (version, hash, chunk_summary)
+    };
 
     let now_ms =
         current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
@@ -1753,11 +1906,18 @@ pub(super) async fn handle_approve_all_draft_chunks(
             "ApproveAllDraftChunks: merging chunk"
         );
 
-        let (version, hash) =
-            merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, chunk).await?;
+        let (version, hash, chunk_summary) = if is_provider_request_chunk(chunk) {
+            approve_provider_request_chunk(state, sandbox.object_name(), chunk).await?;
+            let (version, hash) = current_sandbox_policy_marker(state, &sandbox_id).await?;
+            (version, hash, summarize_provider_request_chunk(chunk)?)
+        } else {
+            let (version, hash) =
+                merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, chunk).await?;
+            let chunk_summary = summarize_draft_chunk_rule(chunk)?;
+            (version, hash, chunk_summary)
+        };
         last_version = version;
         last_hash = hash;
-        let chunk_summary = summarize_draft_chunk_rule(chunk)?;
 
         let now_ms =
             current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
@@ -2135,6 +2295,11 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
         binary: record.binary.clone(),
         validation_result: record.validation_result.clone(),
         rejection_reason: record.rejection_reason.clone(),
+        human_summary: record.human_summary.clone(),
+        intent_summary: record.intent_summary.clone(),
+        request_type: record.request_type.clone(),
+        provider_name: record.provider_name.clone(),
+        provider_type: record.provider_type.clone(),
         ..Default::default()
     })
 }
@@ -3149,9 +3314,9 @@ mod tests {
     }
 
     #[test]
-    fn providers_v2_enabled_defaults_false_when_unset() {
+    fn providers_v2_enabled_defaults_true_when_unset() {
         assert!(
-            !bool_setting_enabled(
+            bool_setting_enabled(
                 &StoredSettings::default(),
                 settings::PROVIDERS_V2_ENABLED_KEY
             )
@@ -3171,8 +3336,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_config_omits_provider_layers_when_v2_disabled() {
+    async fn sandbox_config_omits_provider_layers_when_v2_explicitly_disabled() {
         let state = test_server_state().await;
+        let mut settings = StoredSettings::default();
+        settings.settings.insert(
+            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            StoredSettingValue::Bool(false),
+        );
+        save_global_settings(state.store.as_ref(), &settings)
+            .await
+            .unwrap();
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -4145,6 +4318,93 @@ mod tests {
         assert!(history_after_clear.entries.is_empty());
     }
 
+    #[tokio::test]
+    async fn provider_draft_chunk_approval_attaches_provider_and_returns_policy_marker() {
+        use openshell_core::proto::{GetDraftPolicyRequest, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+
+        let sandbox_name = "provider-draft".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-provider-draft".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(test_policy_with_rule("base_rule", "api.example.com")),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "request_provider_work_github".to_string(),
+                    request_type: "provider".to_string(),
+                    provider_name: "work-github".to_string(),
+                    provider_type: "github".to_string(),
+                    human_summary: "Attach GitHub provider".to_string(),
+                    intent_summary: "Use host-managed GitHub credentials.".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(submit.accepted_chunks, 1);
+
+        let draft_policy = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = draft_policy.chunks[0].id.clone();
+
+        let approve = handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(approve.policy_version, 1);
+        assert!(!approve.policy_hash.is_empty());
+
+        let updated = state
+            .store
+            .get_message_by_name::<Sandbox>(&sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.spec.unwrap().providers,
+            vec!["work-github".to_string()]
+        );
+    }
+
     /// A reviewer's free-form rejection reason must round-trip through
     /// persistence and surface on the chunk via `GetDraftPolicy`, so the
     /// in-sandbox agent can read the guidance and redraft. The MVP-v2 agent
@@ -4867,6 +5127,11 @@ mod tests {
             last_seen_ms: 0,
             validation_result: String::new(),
             rejection_reason: String::new(),
+            human_summary: String::new(),
+            intent_summary: String::new(),
+            request_type: "network_policy".to_string(),
+            provider_name: String::new(),
+            provider_type: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, &chunk.sandbox_id, &chunk)
@@ -4963,6 +5228,11 @@ mod tests {
             last_seen_ms: 0,
             validation_result: String::new(),
             rejection_reason: String::new(),
+            human_summary: String::new(),
+            intent_summary: String::new(),
+            request_type: "network_policy".to_string(),
+            provider_name: String::new(),
+            provider_type: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
@@ -5064,6 +5334,11 @@ mod tests {
             last_seen_ms: 0,
             validation_result: String::new(),
             rejection_reason: String::new(),
+            human_summary: String::new(),
+            intent_summary: String::new(),
+            request_type: "network_policy".to_string(),
+            provider_name: String::new(),
+            provider_type: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)

@@ -10,10 +10,11 @@ use std::time::Duration;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, PolicyChunk, PolicySource,
-    PolicyStatus, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
-    inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, ListSandboxProvidersRequest,
+    PolicyChunk, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UpdateConfigRequest, datamodel::v1::Provider, inference_client::InferenceClient,
+    open_shell_client::OpenShellClient,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -377,6 +378,20 @@ impl CachedOpenShellClient {
             .await
             .into_diagnostic()?;
         Ok(response.into_inner().chunks)
+    }
+
+    /// List providers attached to this sandbox. Used by policy.local so
+    /// in-sandbox agents can observe attachment state without seeing secrets.
+    pub async fn list_sandbox_providers(&self, sandbox_name: &str) -> Result<Vec<Provider>> {
+        let response = self
+            .client
+            .clone()
+            .list_sandbox_providers(ListSandboxProvidersRequest {
+                sandbox_name: sandbox_name.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+        Ok(response.into_inner().providers)
     }
 
     /// Report policy load status back to the server.

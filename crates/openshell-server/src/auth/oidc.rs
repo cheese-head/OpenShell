@@ -46,6 +46,7 @@ const SANDBOX_SECRET_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/ReportPolicyStatus",
     "/openshell.v1.OpenShell/PushSandboxLogs",
     "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+    "/openshell.v1.OpenShell/ListSandboxProviders",
     "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
     "/openshell.sandbox.v1.SandboxService/GetSandboxConfig",
     "/openshell.inference.v1.Inference/GetInferenceBundle",
@@ -474,6 +475,9 @@ mod tests {
         ));
         assert!(is_sandbox_secret_method(
             "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
+        ));
+        assert!(is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/ListSandboxProviders"
         ));
         assert!(is_sandbox_secret_method(
             "/openshell.v1.OpenShell/ReportPolicyStatus"

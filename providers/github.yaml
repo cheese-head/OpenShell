@@ -23,4 +23,12 @@ endpoints:
     protocol: rest
     access: read-only
     enforcement: enforce
-binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]
+binaries:
+  - /usr/bin/gh
+  - /usr/local/bin/gh
+  - /usr/bin/git
+  - /usr/local/bin/git
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+  - /usr/bin/node
+  - /usr/local/bin/node
