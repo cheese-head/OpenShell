@@ -8,274 +8,458 @@ state: review
 
 ## Summary
 
-This RFC makes `openshell-driver-vm` extensible without splitting the VM
-driver into multiple driver crates.
+This RFC adds an in-tree DPU extension for `openshell-driver-vm`.
+The extension is vendor-neutral at the host-driver layer, with
+BlueField as the first concrete coordinator backend.
 
-It introduces two core changes:
+The extension lets the VM driver attach a DPU-backed VF/SF to a sandbox
+VM, pass the device through to the guest, and delegate L2/L3/L4 network
+policy enforcement to a DPU-side coordinator. When the coordinator
+supports storage provisioning, the same extension boundary can also
+provide a DPU-provisioned rootfs block device to the VM driver.
 
-1. `template.runtime_class_name` selects the VM backend:
-   `libkrun`, `qemu`, or omitted for the default.
-2. `VmLifecycleExtension` lets in-tree extensions participate in VM
-   launch, launch result handling, delete, and restart reconcile.
-
-The default behavior is unchanged: if no backend is requested and no
-extension is configured, the VM driver behaves as it does today.
+Default OpenShell builds and deployments without DPU hardware are
+unchanged. The extension runs only when `dpu` is listed in VM-driver
+extension config.
 
 ## Goals
 
-- Let users request QEMU without also requesting a GPU.
-- Keep `libkrun` as the default VM backend.
-- Give in-tree VM extensions a supported way to add launch-time
-  resources such as VFIO devices, DPU-backed NICs, vDPA devices, vTPMs,
-  encrypted volumes, or audit hooks.
-- Keep extension state isolated by extension and sandbox.
-- Make restart reconcile explicit, observable, and advisory by default.
-- Keep user-facing resource requests separate from VM-driver internal
-  attachment details.
+- Provide an in-tree DPU consumer of the VM-driver lifecycle extension
+  API.
+- Keep host-side DPU integration vendor-neutral.
+- Use BlueField as the first concrete backend without requiring DOCA or
+  Comch in the OpenShell tree.
+- Let DPU coordinators watch sandbox network policy directly from the
+  gateway.
+- Scope DPU policy access by coordinator identity.
+- Preserve existing in-guest L7 policy enforcement and add DPU-side
+  L2/L3/L4 enforcement for the VF/SF data path.
+- Make policy delivery projection-based so future DPU-capable policy
+  domains can be added explicitly.
+- Keep DPU operator settings separate from portable sandbox resource
+  requests.
+- Use the VM driver's typed launch-plan attachments for VF/SF, vDPA, and
+  DPU-provisioned storage rather than raw QEMU argument injection.
 
 ## Non-Goals
 
-- A new `openshell-driver-qemu` crate.
-- Out-of-tree extension support.
-- A public resource-claim API.
-- Treating `runtime_class_name` as a network attachment selector.
-- Replacing gateway-level compute hooks.
-- Automatic VM restart within the same sandbox lifetime.
+- Defining a separate VM-driver lifecycle extension API.
+- Shipping DOCA SDK, Comch transport, or vendor-proprietary link
+  dependencies.
+- Replacing the in-guest OPA/L7 proxy.
+- A final public API for choosing DPU-only networking, vDPA, or
+  DPU-provisioned rootfs.
+- Multi-DPU per-host scheduling.
+- Moving a running sandbox between DPUs.
+- Live migration or hot-plug of DPU attachments.
+- A required SNAP implementation in the first upstream slice.
 
 ## Core Components
 
-### Runtime Class
+### Host Extension
 
-`template.runtime_class_name` selects the VM backend:
+`openshell-dpu-extension` implements `VmLifecycleExtension` and
+registers as `dpu` in the VM driver's extension registry.
 
-```yaml
-spec:
-  template:
-    runtime_class_name: qemu
+The extension:
+
+- calls a `DpuCoordinator` before VM launch to allocate a VF/SF;
+- updates the VM launch plan with typed network, device, and optional
+  storage attachments;
+- persists attachment state under the sandbox's extension state;
+- reports launch, detach, policy, and health events;
+- detaches on sandbox delete;
+- reconciles DPU state after driver restart.
+
+### Coordinator Trait
+
+`DpuCoordinator` abstracts the host-to-DPU attachment lifecycle.
+
+The trait covers:
+
+- `health`: firmware, SR-IOV mode, OVS offload, and required control
+  checks;
+- `attach`: allocate a VF/SF or vDPA endpoint, install initial
+  enforcement, and return typed VM attachment details;
+- `provision_rootfs` (optional capability): prepare or expose a
+  DPU-backed rootfs/block device and return a typed storage attachment;
+- `detach`: idempotently release an attachment;
+- `list`: report coordinator-known attachments;
+- `reconcile`: compare host-restored state with coordinator state;
+- `watch_attachment_events`: stream policy and health events back to
+  the host extension.
+
+The host extension is written against this trait rather than against
+BlueField-specific code.
+
+### Coordinator Backends
+
+This RFC defines two in-tree coordinator backends:
+
+| Backend | Purpose | Default |
+| --- | --- | --- |
+| `fake` | Unit and integration testing without DPU hardware. | on |
+| `bluefield-grpc` | mTLS gRPC client for the BlueField coordinator daemon. | off |
+
+Other vendors can add new coordinator backends without changing the
+host extension contract.
+
+### BlueField Coordinator
+
+`openshell-bluefield-coordinator` is the DPU-side daemon. It runs on
+the BlueField ARM cores and owns:
+
+- VF/SF allocation;
+- vDPA endpoint allocation when supported;
+- optional DPU-backed rootfs/block-device provisioning;
+- representor and OVS programming;
+- policy application and verification;
+- durable on-DPU attachment registry;
+- policy streaming from the gateway;
+- event emission back to the host extension.
+
+The host driver instructs the coordinator to attach and detach
+sandboxes. The coordinator owns policy enforcement and policy updates.
+
+### Gateway Policy Stream
+
+`WatchSandboxPolicies` is a gateway RPC for DPU coordinators.
+
+It streams authorized policy projections to coordinator identities. The
+initial projection is `NetworkScope`, which is the only projection this
+RFC requires. The stream uses:
+
+- `INITIAL` events for initial state;
+- `DELTA` events for updates;
+- `REMOVED` events for deletion;
+- monotonic `seq` values;
+- slow-consumer disconnects;
+- per-coordinator authorization.
+
+There is no polling fallback. If the gateway does not support the
+stream, the DPU extension fails startup cleanly.
+
+### Policy Projections
+
+The gateway must not send the full sandbox policy blob to the DPU.
+Instead, it emits explicit, versioned projections. Each projection has
+its own schema, capability gate, authorization check, and threat-model
+treatment.
+
+The first projection is `NetworkScope`, covering L2/L3/L4 enforcement
+for the VF/SF data path. Future projections may be added for domains a
+DPU or SmartNIC can actually enforce, such as HTTP/L7 inspection,
+credential handling, or selected sandbox identity metadata.
+
+Projection rules:
+
+- projections are opt-in by coordinator capability;
+- projections are scoped to delegated sandboxes only;
+- each projection exposes the minimum fields needed for enforcement;
+- fields that are not enforceable by the DPU stay out of the
+  projection;
+- credentials and sensitive metadata require their own projection and
+  authorization, not implicit inclusion in `NetworkScope`.
+
+Example shape:
+
+```proto
+message PolicyProjection {
+  string sandbox_id = 1;
+  string attachment_id = 2;
+  NetworkScope network = 10;
+  HttpScope http = 11;          // optional future projection
+  CredentialScope credentials = 12; // optional future projection
+  MetadataScope metadata = 13;  // optional future projection
+}
 ```
 
-Supported values:
+This keeps the policy stream generic without turning it into a broad
+"read all policy" channel.
 
-| Value | Behavior |
-| --- | --- |
-| omitted | Use the driver default, initially `libkrun`. |
-| `libkrun` | Use the existing libkrun path. |
-| `qemu` | Use QEMU with TAP and vsock. |
+### Policy Reader Role
 
-GPU selection remains independent from backend selection. A GPU request
-with `libkrun` is rejected with a clear error. A GPU request with
-`qemu` uses the existing QEMU + VFIO GPU path.
+The gateway adds a `policy-reader` role for DPU coordinators.
 
-### Lifecycle Extension
+The role is scoped to the sandboxes delegated to that coordinator. A
+coordinator identity cannot subscribe to the whole fleet's network
+policy. The gateway validates sandbox registration against the
+coordinator's attachment-derived allowlist.
 
-`VmLifecycleExtension` is an in-process VM-driver extension trait.
-Extensions are compiled into the VM driver and registered by name.
+### NetworkScope
 
-An extension can:
+`NetworkScope` is the initial policy projection sent to the DPU. It
+contains only the L2/L3/L4 fields a network fabric can enforce.
 
-- allocate per-sandbox state before VM launch;
-- add validated launcher arguments or environment variables;
-- add typed VM attachments;
-- react to launch success or launch failure;
-- clean up on sandbox delete;
-- reconcile its external state after driver restart.
+It does not include:
 
-The VM driver remains the source of truth for sandbox lifecycle. An
-extension owns only the external or attached state it allocates.
+- filesystem policy;
+- process policy;
+- L7 request-body or operation-level policy;
+- provider credentials;
+- unrelated sandbox metadata.
 
-### Launch Plan
-
-Before spawning the VM, the driver builds a `VmLaunchPlan`.
-Configured extensions receive a restricted view of that plan and may add
-attachment bodies through driver-owned APIs.
-
-The driver stamps the extension namespace on every attachment. An
-extension cannot forge another extension's namespace in metrics, OCSF
-events, persisted state, or launcher validation output.
-
-### Attachments
-
-`VmAttachment` is the driver-internal representation of launch-time
-resources. Attachment bodies may include:
-
-- launcher arguments and environment variables;
-- storage attachments;
-- device attachments;
-- future typed attachment variants.
-
-`LauncherArgs` exists as a bounded escape hatch. The renderer validates
-allowed flag prefixes, maximum counts, maximum lengths, and
-driver-stamped environment prefixes before the command is spawned.
-
-### Extension State
-
-Each extension may return a `PersistedExtensionState` from
-`before_vm_launch`.
-
-State is stored per sandbox and per extension:
-
-```text
-<state_root>/sandboxes/<sandbox_id>/extensions/<extension_name>.json
-```
-
-The driver passes that state back only to the extension that created it.
-This supports multiple extensions without state collisions.
-
-### Reconcile
-
-Reconcile runs when the driver starts:
-
-1. `reconcile_before_restore`: extension-level health and global checks.
-2. VM driver reloads persisted sandboxes.
-3. `reconcile_after_restore`: extension checks restored live sandboxes
-   against external or attached state.
-
-Reconcile outcomes:
-
-| Outcome | Meaning |
-| --- | --- |
-| `Ok` | No drift. |
-| `Advisory(report)` | Drift found; report only. |
-| `Authoritative(report)` | Drift found; extension may repair or clean up. |
-| `Failed(status, report)` | Reconcile could not complete. |
-
-`advisory` is the default. An extension can perform authoritative repair
-only when both are true:
-
-- the extension declares support for authoritative reconcile;
-- the operator sets `reconcile_mode = "authoritative"` for that
-  extension.
-
-Otherwise authoritative outcomes are demoted to advisory behavior.
-
-## Operator Configuration
-
-Extensions are configured in VM-driver TOML:
-
-```toml
-[vm]
-extensions = ["logging"]
-
-[vm.extension."logging"]
-reconcile_mode = "advisory"
-
-[vm.extension."logging".timeouts]
-before_vm_launch_ms = 15000
-```
-
-Rules:
-
-- unknown extension names fail driver startup;
-- extension order follows the config list;
-- unknown config keys fail startup via typed deserialization;
-- absent or empty `extensions` means no extension chain;
-- no extension can enable itself at runtime.
+Those domains can be added only through separate projections with
+separate coordinator capabilities and authorization rules.
 
 ## Relationship to Resource Requests
 
-This API is not the public resource request model.
+The DPU extension is not a public resource request API.
 
-Public sandbox intent, such as "I need one GPU", "I need a DPU-backed
-network function", or "I need a vDPA network device", should be
-expressed through typed sandbox resource requirements or
-driver-specific config namespaces.
+Portable sandbox intent such as "attach a DPU-backed VF/SF" should be
+expressed through typed device or generic resource requirements with a
+stable class name, count, selectors, and namespaced parameters.
 
-The VM driver then realizes that request after it has been selected.
-For example:
+The VM driver realizes that request after it has been selected:
 
-- a portable GPU request may compile into QEMU VFIO GPU arguments;
-- a DPU-backed NIC request may compile into a DPU extension attachment;
-- a vDPA request may compile into a future VM network/device extension;
-- a plain QEMU backend request may use TAP because that is how the QEMU
-  backend currently connects networking.
+```text
+resource requirement
+  -> gateway selects VM driver
+  -> VM driver builds launch plan
+  -> dpu extension allocates VF/SF, vDPA, or DPU rootfs as requested
+  -> dpu extension updates typed launch-plan attachments
+  -> VM driver validates and renders the final launch plan
+```
 
-`runtime_class_name` chooses the VM backend. It should not be overloaded
-to mean "use TAP", "use VFIO", or "use vDPA".
+Deployment-specific settings remain extension config, including:
 
-## TAP, VFIO, and vDPA
+- coordinator backend;
+- coordinator endpoint;
+- mTLS material;
+- initial policy behavior;
+- stale policy behavior;
+- rate limits;
+- `reconcile_mode`.
 
-This RFC enables the VM driver to support TAP, VFIO, and vDPA, but it
-does not define a final user-facing selector for all of them.
+Public request fields describe what the sandbox needs. DPU extension
+config describes how this deployment provides it.
 
-Current interpretation:
+## VM Launch Plan Integration
 
-| User intent | Intended path |
-| --- | --- |
-| Use QEMU | `runtime_class_name = "qemu"` |
-| Use default libkrun path | omit `runtime_class_name` or set `libkrun` |
-| Use QEMU's normal TAP networking | selected implicitly by QEMU backend |
-| Attach a GPU by VFIO | typed GPU resource request plus VM driver realization |
-| Attach a DPU-backed VF/SF | typed device or generic resource request plus DPU extension |
-| Attach vDPA | future typed resource request plus VM extension |
+The DPU extension consumes the VM driver's typed launch plan. It does
+not primarily contribute raw QEMU arguments.
 
-The important boundary is:
+The extension may update:
 
-- user-facing requests describe *what* the sandbox needs;
-- VM-driver extensions describe *how* this VM driver realizes that need.
+- `plan.network`: replace the default TAP attachment with
+  `VmNetworkAttachment::VfioPci` for a VF/SF, or
+  `VmNetworkAttachment::Vdpa` for a vDPA endpoint;
+- `plan.devices`: add supporting `VmDeviceAttachment::VfioPci` devices
+  when the DPU integration needs a non-network PCI device passed through;
+- `plan.rootfs`: replace the default host-file root block device with
+  `VmStorageAttachment::DpuProvisioned` when the coordinator exposes a
+  DPU-provisioned rootfs/block device.
 
-## Lifecycle Flow
+The default QEMU path still uses host-file rootfs plus TAP/vsock. A DPU
+extension can deliberately omit TAP by replacing `plan.network` before
+the driver validates and renders the launcher configuration.
+
+## Operator Configuration
+
+The extension is enabled through VM-driver config:
+
+```toml
+[vm]
+extensions = ["dpu"]
+
+[vm.extension."dpu"]
+coordinator = "bluefield-grpc"     # or "fake"
+coordinator_endpoint = "https://192.168.100.2:8443"
+coordinator_ca_path  = "/etc/openshell/dpu/coordinator-ca.pem"
+client_cert_path     = "/etc/openshell/dpu/host-client.pem"
+client_key_path      = "/etc/openshell/dpu/host-client.key"
+
+initial_policy = "wait-initial"    # "wait-initial" | "baseline"
+initial_policy_timeout_ms = 5000
+network_class_defaults = "dpu-ovs-isolated"
+
+stale_threshold_ms = 30000
+on_stale = "keep-last-known"       # "keep-last-known" | "deny-all"
+
+reconcile_mode = "advisory"        # or "authoritative"
+max_attach_qps = 50
+max_attachments = 1024
+```
+
+Unknown keys fail startup through typed config deserialization.
+
+## Attachment Lifecycle
 
 Create path:
 
 ```text
-gateway selects VM driver
-  -> VM driver selects backend from runtime_class_name
-  -> driver builds VmLaunchPlan
-  -> extension.before_vm_launch in config order
-  -> driver validates rendered launcher args
-  -> driver spawns VM
-  -> extension.after_vm_launch_succeeded
-     or extension.after_vm_launch_failed in reverse order
+VM driver selected
+  -> dpu.before_vm_launch
+  -> coordinator.attach
+  -> coordinator installs initial enforcement
+  -> extension returns PersistedExtensionState
+  -> extension updates plan.network / plan.devices / plan.rootfs
+  -> VM driver validates and renders typed attachments
+  -> VM driver launches sandbox
+  -> extension reports bound or detaches on launch failure
 ```
 
 Delete path:
 
 ```text
 gateway deletes sandbox
-  -> driver terminates VM if needed
-  -> extension.after_sandbox_deleted in reverse order
-  -> driver removes sandbox state
+  -> VM driver terminates VM if needed
+  -> dpu.after_sandbox_deleted
+  -> coordinator.detach
+  -> extension state removed
 ```
 
-Restart path:
+The attachment lifetime equals the sandbox lifetime. VM process exit
+does not immediately detach the DPU resource; delete does.
 
-```text
-driver starts
-  -> extension.reconcile_before_restore
-  -> driver restores live sandbox records
-  -> extension.reconcile_after_restore
-  -> conditions and metrics report drift or failure
-```
+### DPU-Provisioned Rootfs
+
+If the coordinator advertises rootfs provisioning, `attach` or
+`provision_rootfs` may return a DPU-backed block device. The host
+extension represents that as `VmStorageAttachment::DpuProvisioned`.
+
+The RFC intentionally keeps the storage backend behind the coordinator
+trait. A BlueField implementation may use SNAP, NVMe emulation, a block
+device exposed to the host, or another mechanism, but the VM driver only
+sees the typed storage attachment and renders it into the QEMU storage
+configuration.
+
+## Initial Policy Bootstrap
+
+The extension must avoid exposing a VF/SF to a guest before enforcement
+is installed.
+
+Two modes are supported:
+
+| Mode | Behavior |
+| --- | --- |
+| `wait-initial` | Register sandbox, wait for gateway `INITIAL`, apply it, then return from `attach`. Timeout fails the create. |
+| `baseline` | Apply `network_class_defaults`, return from `attach`, then replace with gateway `INITIAL` when it arrives. |
+
+`wait-initial` is the default because it fails closed when the policy
+stream is unavailable.
+
+## Reconcile
+
+On driver restart:
+
+1. `reconcile_before_restore` calls `DpuCoordinator::health`.
+2. The VM driver reloads persisted sandbox state.
+3. `reconcile_after_restore` compares restored host state with
+   coordinator state.
+
+Advisory is the default:
+
+- orphaned DPU attachments are reported as drift;
+- no cleanup is performed;
+- operators can inspect conditions and logs.
+
+Authoritative reconcile is opt-in:
+
+- the extension must support authoritative behavior;
+- the operator must set `reconcile_mode = "authoritative"`;
+- the coordinator may garbage-collect attachments it still owns but
+  the host driver no longer knows about.
+
+## Lease Fencing
+
+Every attachment has:
+
+- `attachment_id`;
+- `lease_generation`;
+- `sandbox_id`;
+- `host_instance_id`.
+
+`lease_generation` is monotonic per attachment. The coordinator rejects
+stale detach or reconcile operations whose generation is older than the
+highest generation it has observed for that attachment.
+
+This prevents an old host process or stale restored state from
+corrupting a newer attachment allocation.
+
+## Failure Behavior
+
+Policy and coordinator failures can be configured to fail open or fail
+closed where appropriate.
+
+Recommended defaults:
+
+| Failure | Default |
+| --- | --- |
+| Gateway policy stream down before attach | fail closed in `wait-initial` |
+| Policy update apply failure | keep last known policy |
+| Previous policy unusable or stale | emit `PolicyStale`; optional deny-all |
+| Coordinator health missing required controls | refuse new attaches |
+| Stale host detach operation | reject by lease generation |
+
+## Security Model
+
+The strongest property is available only when the DPU has an out-of-band
+path to the gateway that the host cannot observe or terminate.
+
+With that topology:
+
+- VF/SF egress traverses the DPU representor and can be enforced even
+  if the guest is compromised.
+- The host driver is not in the policy-read path.
+- DPU policy-stream credentials are scoped to the coordinator's
+  delegated sandboxes and authorized projections.
+- Sensitive policy domains such as L7, credentials, and metadata are
+  not exposed unless their projection is explicitly enabled.
+
+Important limitation:
+
+- The default QEMU path still has TAP + virtio-net. A DPU extension must
+  replace the network plan and omit TAP for deployments that require all
+  guest egress to traverse the DPU-controlled data path. If TAP remains
+  present, this RFC enforces only the VF/SF or vDPA data path and does
+  not claim all guest egress is DPU-enforced.
+
+## mTLS and Identity
+
+The BlueField coordinator authenticates to the gateway with a dedicated
+coordinator credential.
+
+Requirements:
+
+- coordinator private key stays on the DPU;
+- gateway maps coordinator identity to an allowlist of sandbox
+  attachments;
+- cert renewal and revocation are supported;
+- CA rotation uses a dual-trust window;
+- host proxying of the stream is allowed only for explicitly configured
+  development scenarios.
 
 ## Observability
 
-The driver emits extension metrics and conditions for:
+The extension and coordinator emit:
 
-- hook duration and outcome;
-- rollback count;
-- reconcile outcome;
-- dropped condition or OCSF events;
-- launcher argument validation failures;
-- unhealthy extensions.
-
-OCSF events emitted by extensions are stamped by the driver with:
-
-- `extension_layer = "vm-driver"`
-- `extension_name = <extension name>`
+- driver-level conditions such as `DpuCoordinatorHealthy`;
+- per-sandbox conditions such as `DpuAttachInProgress`,
+  `DpuAttachmentBound`, `DpuPolicyApplied`, `DpuPolicyDegraded`,
+  `DpuPolicyStale`, and `DpuFirmwareDegraded`;
+- OCSF events tagged with the VM-driver extension name;
+- coordinator metrics for policy apply latency, offload status,
+  event stream reconnects, attachment count, and stale policy count.
 
 ## Compatibility
 
-- Empty extension chain preserves existing behavior.
-- Omitted `runtime_class_name` preserves existing backend selection.
-- QEMU + GPU continues to work through the existing path.
-- QEMU without GPU becomes valid.
-- `bound_threshold_ms` defaults to `0`, preserving today's
-  ready-after-spawn behavior unless operators opt in to a liveness
-  threshold.
+- Default builds do not compile the BlueField gRPC backend.
+- The fake backend keeps host-side tests available without hardware.
+- The extension does not run unless configured.
+- Existing VM sandboxes are unaffected.
+- Existing in-guest L7 enforcement remains in place.
+- No DOCA, Comch, or proprietary SDK dependency is introduced.
 
 ## Open Questions
 
-- Should TAP, VFIO, and vDPA get a shared typed network attachment
-  request shape, or remain separate resource classes?
-- Should per-sandbox backend or bound-threshold overrides be added?
-- Should runtime extension reload be supported later?
+- Should the DPU resource class be a standard typed device class or a
+  generic resource extension?
+- What public resource/profile should select DPU-only networking, vDPA,
+  or DPU-provisioned rootfs?
+- Should `reconcile_mode` remain advisory by default for DPU, or should
+  some deployments opt into authoritative by default?
+- Should the shared DPU proto remain vendor-neutral, or should vendors
+  own separate coordinator protos behind the same trait?
+- Should topology verification fail closed automatically at coordinator
+  startup?
