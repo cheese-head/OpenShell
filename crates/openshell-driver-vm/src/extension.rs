@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::runtime::{
-    VmBackend, VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig, VmStorageAttachment,
+use crate::attachments::{
+    VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig, VmStorageAttachment,
 };
+use crate::runtime::VmBackend;
 use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::attachments::{VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig};
 use crate::extension::{
     LaunchAbortReason, ReconcileOutcome, VmLaunchPlan, VmLifecycleError, VmLifecycleExtensions,
 };
@@ -13,7 +14,7 @@ use crate::rootfs::{
     extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
     set_rootfs_image_file_mode, write_rootfs_image_file,
 };
-use crate::runtime::{VmBackend, VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig};
+use crate::runtime::VmBackend;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
@@ -47,6 +48,7 @@ use openshell_vfio::SysfsRoot;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::net::Ipv4Addr;
@@ -1221,53 +1223,12 @@ impl VmDriver {
 
     #[allow(clippy::result_large_err)]
     fn launch_command_from_plan(&self, plan: &VmLaunchPlan) -> Result<Command, Status> {
-        plan.validate()
-            .map_err(|err| Status::failed_precondition(format!("invalid VM launch plan: {err}")))?;
-
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
-        command.arg("--internal-run-vm");
-        command
-            .arg("--vm-rootfs-config")
-            .arg(serde_json::to_string(&plan.rootfs).map_err(|err| {
-                Status::internal(format!("serialize VM rootfs config failed: {err}"))
-            })?);
-        command.arg("--vm-exec").arg(&plan.exec_path);
-        command.arg("--vm-workdir").arg(&plan.workdir);
-        command.arg("--vm-console-output").arg(&plan.console_output);
-        command.arg("--vm-vcpus").arg(plan.vcpus.to_string());
-        command.arg("--vm-mem-mib").arg(plan.mem_mib.to_string());
-        command
-            .arg("--vm-krun-log-level")
-            .arg(plan.krun_log_level.to_string());
-        match plan.backend {
-            VmBackend::Libkrun => {}
-            VmBackend::Qemu => {
-                command.arg("--vm-backend").arg("qemu");
-            }
-        }
-        for network in &plan.network {
-            command
-                .arg("--vm-network-attachment")
-                .arg(serde_json::to_string(network).map_err(|err| {
-                    Status::internal(format!("serialize VM network attachment failed: {err}"))
-                })?);
-        }
-        for device in &plan.devices {
-            command
-                .arg("--vm-device-attachment")
-                .arg(serde_json::to_string(device).map_err(|err| {
-                    Status::internal(format!("serialize VM device attachment failed: {err}"))
-                })?);
-        }
-
-        for env in &plan.env {
-            command.arg("--vm-env").arg(env);
-        }
-        command.args(&plan.extra_launcher_args);
+        command.args(launcher_args_from_plan(plan)?);
         Ok(command)
     }
 
@@ -2620,6 +2581,58 @@ impl VmDriver {
         attach_vm_progress_metadata(&mut event);
         self.publish_platform_event(sandbox_id.to_string(), event);
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn launcher_args_from_plan(plan: &VmLaunchPlan) -> Result<Vec<OsString>, Status> {
+    plan.validate()
+        .map_err(|err| Status::failed_precondition(format!("invalid VM launch plan: {err}")))?;
+
+    let mut args = Vec::new();
+    args.push(OsString::from("--internal-run-vm"));
+    args.push(OsString::from("--vm-rootfs-config"));
+    args.push(OsString::from(
+        serde_json::to_string(&plan.rootfs)
+            .map_err(|err| Status::internal(format!("serialize VM rootfs config failed: {err}")))?,
+    ));
+    args.push(OsString::from("--vm-exec"));
+    args.push(OsString::from(&plan.exec_path));
+    args.push(OsString::from("--vm-workdir"));
+    args.push(OsString::from(&plan.workdir));
+    args.push(OsString::from("--vm-console-output"));
+    args.push(plan.console_output.clone().into_os_string());
+    args.push(OsString::from("--vm-vcpus"));
+    args.push(OsString::from(plan.vcpus.to_string()));
+    args.push(OsString::from("--vm-mem-mib"));
+    args.push(OsString::from(plan.mem_mib.to_string()));
+    args.push(OsString::from("--vm-krun-log-level"));
+    args.push(OsString::from(plan.krun_log_level.to_string()));
+    match plan.backend {
+        VmBackend::Libkrun => {}
+        VmBackend::Qemu => {
+            args.push(OsString::from("--vm-backend"));
+            args.push(OsString::from("qemu"));
+        }
+    }
+    for network in &plan.network {
+        args.push(OsString::from("--vm-network-attachment"));
+        args.push(OsString::from(serde_json::to_string(network).map_err(
+            |err| Status::internal(format!("serialize VM network attachment failed: {err}")),
+        )?));
+    }
+    for device in &plan.devices {
+        args.push(OsString::from("--vm-device-attachment"));
+        args.push(OsString::from(serde_json::to_string(device).map_err(
+            |err| Status::internal(format!("serialize VM device attachment failed: {err}")),
+        )?));
+    }
+
+    for env in &plan.env {
+        args.push(OsString::from("--vm-env"));
+        args.push(OsString::from(env));
+    }
+    args.extend(plan.extra_launcher_args.iter().map(OsString::from));
+    Ok(args)
 }
 
 #[tonic::async_trait]
@@ -4609,6 +4622,7 @@ mod tests {
     };
     use prost_types::{Struct, Value, value::Kind};
     use serde_json::json;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::Path;
     use std::sync::Mutex as StdMutex;
@@ -5519,6 +5533,64 @@ mod tests {
         assert!(err.contains("OPENSHELL_VM_TLS_CA"));
     }
 
+    #[test]
+    fn launch_command_from_plan_serializes_typed_attachments() {
+        let mut plan = minimal_launch_plan();
+        plan.backend = VmBackend::Qemu;
+        plan.rootfs = VmRootfsConfig::host_files(
+            PathBuf::from("/tmp/root.ext4"),
+            PathBuf::from("/tmp/overlay.ext4"),
+            Some(PathBuf::from("/tmp/image.ext4")),
+        );
+        plan.network = vec![
+            VmNetworkAttachment::Tap {
+                ifname: "vmtap-test".to_string(),
+                guest_ip: "10.0.0.2".to_string(),
+                host_ip: "10.0.0.1".to_string(),
+                mac: "02:00:00:00:00:01".to_string(),
+                gateway_port: Some(8443),
+            },
+            VmNetworkAttachment::Vdpa {
+                device: PathBuf::from("/dev/vhost-vdpa-0"),
+                mac: Some("02:00:00:00:00:02".to_string()),
+            },
+        ];
+        plan.devices = vec![
+            VmDeviceAttachment::VfioPci {
+                bdf: "0000:03:00.0".to_string(),
+                id: Some("gpu".to_string()),
+            },
+            VmDeviceAttachment::Vsock { cid: 42 },
+        ];
+
+        let args =
+            launcher_args_from_plan(&plan).expect("launch plan should serialize into arguments");
+
+        let rootfs_values = command_arg_values(&args, "--vm-rootfs-config");
+        assert_eq!(rootfs_values.len(), 1);
+        let rootfs: VmRootfsConfig = serde_json::from_str(&rootfs_values[0]).unwrap();
+        assert_eq!(rootfs, plan.rootfs);
+
+        let network: Vec<VmNetworkAttachment> =
+            command_arg_values(&args, "--vm-network-attachment")
+                .into_iter()
+                .map(|value| serde_json::from_str(&value).unwrap())
+                .collect();
+        assert_eq!(network, plan.network);
+
+        let devices: Vec<VmDeviceAttachment> = command_arg_values(&args, "--vm-device-attachment")
+            .into_iter()
+            .map(|value| serde_json::from_str(&value).unwrap())
+            .collect();
+        assert_eq!(devices, plan.devices);
+
+        assert!(
+            args.windows(2)
+                .any(|window| window[0].as_os_str() == OsStr::new("--vm-backend")
+                    && window[1].as_os_str() == OsStr::new("qemu"))
+        );
+    }
+
     #[tokio::test]
     async fn lifecycle_extension_mutates_launch_plan_and_persists_state() {
         let base = unique_temp_dir();
@@ -6153,6 +6225,13 @@ mod tests {
             devices: Vec::new(),
             extra_launcher_args: Vec::new(),
         }
+    }
+
+    fn command_arg_values(args: &[OsString], flag: &str) -> Vec<String> {
+        args.windows(2)
+            .filter(|window| window[0].as_os_str() == OsStr::new(flag))
+            .map(|window| window[1].to_string_lossy().into_owned())
+            .collect()
     }
 
     #[derive(Debug)]
