@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{embedded_runtime, ffi, nft_ruleset, procguard, rootfs};
+use serde::{Deserialize, Serialize};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
@@ -30,6 +31,106 @@ pub enum VmBackend {
     Qemu,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VmStorageAttachment {
+    HostFile {
+        path: PathBuf,
+        #[serde(default)]
+        read_only: bool,
+    },
+    HostBlockDevice {
+        path: PathBuf,
+        #[serde(default)]
+        read_only: bool,
+    },
+    DpuProvisioned {
+        id: String,
+        device: PathBuf,
+        #[serde(default)]
+        read_only: bool,
+    },
+}
+
+impl VmStorageAttachment {
+    pub fn host_file(path: PathBuf, read_only: bool) -> Self {
+        Self::HostFile { path, read_only }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::HostFile { path, .. } | Self::HostBlockDevice { path, .. } => path,
+            Self::DpuProvisioned { device, .. } => device,
+        }
+    }
+
+    pub fn read_only(&self) -> bool {
+        match self {
+            Self::HostFile { read_only, .. }
+            | Self::HostBlockDevice { read_only, .. }
+            | Self::DpuProvisioned { read_only, .. } => *read_only,
+        }
+    }
+
+    fn requires_regular_file(&self) -> bool {
+        matches!(self, Self::HostFile { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmRootfsConfig {
+    pub root: VmStorageAttachment,
+    pub overlay: VmStorageAttachment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<VmStorageAttachment>,
+}
+
+impl VmRootfsConfig {
+    pub fn host_files(root: PathBuf, overlay: PathBuf, image: Option<PathBuf>) -> Self {
+        Self {
+            root: VmStorageAttachment::host_file(root, true),
+            overlay: VmStorageAttachment::host_file(overlay, false),
+            image: image.map(|path| VmStorageAttachment::host_file(path, true)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VmNetworkAttachment {
+    Tap {
+        ifname: String,
+        guest_ip: String,
+        host_ip: String,
+        mac: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway_port: Option<u16>,
+    },
+    VfioPci {
+        bdf: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mac: Option<String>,
+    },
+    Vdpa {
+        device: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mac: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VmDeviceAttachment {
+    VfioPci {
+        bdf: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    Vsock {
+        cid: u32,
+    },
+}
+
 // virtio-net feature bits (see Linux `include/uapi/linux/virtio_net.h`).
 const NET_FEATURE_CSUM: u32 = 1 << 0;
 const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
@@ -45,9 +146,7 @@ const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_UFO;
 
 pub struct VmLaunchConfig {
-    pub root_disk: PathBuf,
-    pub overlay_disk: PathBuf,
-    pub image_disk: Option<PathBuf>,
+    pub rootfs: VmRootfsConfig,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub exec_path: String,
@@ -57,13 +156,8 @@ pub struct VmLaunchConfig {
     pub log_level: u32,
     pub console_output: PathBuf,
     pub backend: VmBackend,
-    pub gpu_bdf: Option<String>,
-    pub tap_device: Option<String>,
-    pub guest_ip: Option<String>,
-    pub host_ip: Option<String>,
-    pub vsock_cid: Option<u32>,
-    pub guest_mac: Option<String>,
-    pub gateway_port: Option<u16>,
+    pub network: Vec<VmNetworkAttachment>,
+    pub devices: Vec<VmDeviceAttachment>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -74,47 +168,7 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
 }
 
 fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    let gpu_bdf = config
-        .gpu_bdf
-        .as_deref()
-        .ok_or("gpu_bdf is required for QEMU backend")?;
-    let tap_device = config
-        .tap_device
-        .as_deref()
-        .ok_or("tap_device is required for QEMU backend")?;
-    let guest_mac = config
-        .guest_mac
-        .as_deref()
-        .ok_or("guest_mac is required for QEMU backend")?;
-    let vsock_cid = config
-        .vsock_cid
-        .ok_or("vsock_cid is required for QEMU backend")?;
-    let _guest_ip = config
-        .guest_ip
-        .as_deref()
-        .ok_or("guest_ip is required for QEMU backend")?;
-    let host_ip = config
-        .host_ip
-        .as_deref()
-        .ok_or("host_ip is required for QEMU backend")?;
-
-    if !config.root_disk.is_file() {
-        return Err(format!(
-            "root disk image not found: {}",
-            config.root_disk.display()
-        ));
-    }
-    if !config.overlay_disk.is_file() {
-        return Err(format!(
-            "overlay disk image not found: {}",
-            config.overlay_disk.display()
-        ));
-    }
-    if let Some(image_disk) = &config.image_disk
-        && !image_disk.is_file()
-    {
-        return Err(format!("image disk not found: {}", image_disk.display()));
-    }
+    validate_rootfs_attachments(&config.rootfs)?;
 
     if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
         return Err(format!("procguard arm failed: {err}"));
@@ -124,12 +178,23 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     check_kvm_access()?;
 
     let guest_env = qemu_guest_env_vars(config, host_dns_server());
-    write_guest_env_file(&config.overlay_disk, &guest_env)?;
+    write_guest_env_file(config.rootfs.overlay.path(), &guest_env)?;
 
     let runtime_dir = qemu_runtime_dir()?;
-    let gw_port = config.gateway_port.unwrap_or(0);
-    setup_tap_networking(tap_device, host_ip, gw_port)?;
-    let mut tap_guard = TapGuard::new(tap_device.to_string(), host_ip.to_string(), gw_port);
+    let mut tap_guards = Vec::new();
+    for network in &config.network {
+        if let VmNetworkAttachment::Tap {
+            ifname,
+            host_ip,
+            gateway_port,
+            ..
+        } = network
+        {
+            let gateway_port = gateway_port.unwrap_or(0);
+            setup_tap_networking(ifname, host_ip, gateway_port)?;
+            tap_guards.push(TapGuard::new(ifname.clone(), host_ip.clone(), gateway_port));
+        }
+    }
 
     let vmlinux = runtime_dir.join("vmlinux");
     if !vmlinux.is_file() {
@@ -154,27 +219,11 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .arg(&vmlinux)
         .arg("-append")
         .arg(&kernel_cmdline)
-        .args(qemu_disk_args(config))
-        .arg("-netdev")
-        .arg(format!(
-            "tap,id=net0,ifname={tap_device},script=no,downscript=no"
-        ))
-        .arg("-device")
-        .arg("pcie-root-port,id=net_root,slot=3")
-        .arg("-device")
-        .arg(format!(
-            "virtio-net-pci-non-transitional,netdev=net0,mac={guest_mac},bus=net_root"
-        ))
-        .arg("-device")
-        .arg("pcie-root-port,id=vsock_root,slot=1")
-        .arg("-device")
-        .arg(format!(
-            "vhost-vsock-pci,guest-cid={vsock_cid},bus=vsock_root"
-        ))
-        .arg("-device")
-        .arg("pcie-root-port,id=gpu_root,slot=2")
-        .arg("-device")
-        .arg(format!("vfio-pci,host={gpu_bdf},bus=gpu_root"))
+        .args(qemu_disk_args(&config.rootfs))
+        .args(qemu_network_args(&config.network))
+        .args(qemu_device_args(&config.devices));
+
+    qemu_cmd
         .arg("-serial")
         .arg(format!("file:{}", config.console_output.display()));
 
@@ -206,8 +255,10 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .map_err(|e| format!("failed to wait for QEMU: {e}"))?;
 
     CHILD_PID.store(0, Ordering::Relaxed);
-    teardown_tap_networking(tap_device, host_ip, gw_port);
-    tap_guard.disarm();
+    for guard in &mut tap_guards {
+        teardown_tap_networking(&guard.tap_device, &guard.host_ip, guard.gateway_port);
+        guard.disarm();
+    }
 
     if status.success() {
         Ok(())
@@ -216,35 +267,135 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
 }
 
-fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
-    let mut args = vec![
-        "-drive".to_string(),
-        format!(
-            "file={},if=none,format=raw,id=rootfs,readonly=on",
-            config.root_disk.display()
-        ),
-        "-device".to_string(),
-        "virtio-blk-pci,drive=rootfs".to_string(),
-        "-drive".to_string(),
-        format!(
-            "file={},if=none,format=raw,id=overlay",
-            config.overlay_disk.display()
-        ),
-        "-device".to_string(),
-        "virtio-blk-pci,drive=overlay".to_string(),
-    ];
-    if let Some(image_disk) = &config.image_disk {
-        args.extend([
-            "-drive".to_string(),
-            format!(
-                "file={},if=none,format=raw,id=image,readonly=on",
-                image_disk.display()
-            ),
-            "-device".to_string(),
-            "virtio-blk-pci,drive=image".to_string(),
-        ]);
+fn qemu_disk_args(rootfs: &VmRootfsConfig) -> Vec<String> {
+    let mut args = qemu_storage_args("rootfs", &rootfs.root);
+    args.extend(qemu_storage_args("overlay", &rootfs.overlay));
+    if let Some(image) = &rootfs.image {
+        args.extend(qemu_storage_args("image", image));
     }
     args
+}
+
+fn qemu_storage_args(id: &str, storage: &VmStorageAttachment) -> Vec<String> {
+    let mut drive = format!(
+        "file={},if=none,format=raw,id={id}",
+        storage.path().display()
+    );
+    if storage.read_only() {
+        drive.push_str(",readonly=on");
+    }
+    vec![
+        "-drive".to_string(),
+        drive,
+        "-device".to_string(),
+        format!("virtio-blk-pci,drive={id}"),
+    ]
+}
+
+fn qemu_network_args(networks: &[VmNetworkAttachment]) -> Vec<String> {
+    let mut args = Vec::new();
+    for (idx, network) in networks.iter().enumerate() {
+        let net_id = format!("net{idx}");
+        let root_id = format!("net_root{idx}");
+        let slot = 3 + idx;
+        match network {
+            VmNetworkAttachment::Tap { ifname, mac, .. } => {
+                args.extend([
+                    "-netdev".to_string(),
+                    format!("tap,id={net_id},ifname={ifname},script=no,downscript=no"),
+                    "-device".to_string(),
+                    format!("pcie-root-port,id={root_id},slot={slot}"),
+                    "-device".to_string(),
+                    format!(
+                        "virtio-net-pci-non-transitional,netdev={net_id},mac={mac},bus={root_id}"
+                    ),
+                ]);
+            }
+            VmNetworkAttachment::VfioPci { bdf, .. } => {
+                args.extend([
+                    "-device".to_string(),
+                    format!("pcie-root-port,id={root_id},slot={slot}"),
+                    "-device".to_string(),
+                    format!("vfio-pci,host={bdf},bus={root_id}"),
+                ]);
+            }
+            VmNetworkAttachment::Vdpa { device, mac } => {
+                let mut device_arg = format!("virtio-net-pci,netdev={net_id},bus={root_id}");
+                if let Some(mac) = mac {
+                    use std::fmt::Write as _;
+                    let _ = write!(device_arg, ",mac={mac}");
+                }
+                args.extend([
+                    "-netdev".to_string(),
+                    format!("vhost-vdpa,id={net_id},vhostdev={}", device.display()),
+                    "-device".to_string(),
+                    format!("pcie-root-port,id={root_id},slot={slot}"),
+                    "-device".to_string(),
+                    device_arg,
+                ]);
+            }
+        }
+    }
+    args
+}
+
+fn qemu_device_args(devices: &[VmDeviceAttachment]) -> Vec<String> {
+    let mut args = Vec::new();
+    for (idx, device) in devices.iter().enumerate() {
+        match device {
+            VmDeviceAttachment::VfioPci { bdf, .. } => {
+                let root_id = format!("dev_root{idx}");
+                let slot = 16 + idx;
+                args.extend([
+                    "-device".to_string(),
+                    format!("pcie-root-port,id={root_id},slot={slot}"),
+                    "-device".to_string(),
+                    format!("vfio-pci,host={bdf},bus={root_id}"),
+                ]);
+            }
+            VmDeviceAttachment::Vsock { cid } => {
+                let root_id = format!("vsock_root{idx}");
+                let slot = 1 + idx;
+                args.extend([
+                    "-device".to_string(),
+                    format!("pcie-root-port,id={root_id},slot={slot}"),
+                    "-device".to_string(),
+                    format!("vhost-vsock-pci,guest-cid={cid},bus={root_id}"),
+                ]);
+            }
+        }
+    }
+    args
+}
+
+fn validate_rootfs_attachments(rootfs: &VmRootfsConfig) -> Result<(), String> {
+    validate_storage_attachment("root disk", &rootfs.root)?;
+    validate_storage_attachment("overlay disk", &rootfs.overlay)?;
+    if let Some(image) = &rootfs.image {
+        validate_storage_attachment("image disk", image)?;
+    }
+    Ok(())
+}
+
+fn validate_storage_attachment(name: &str, storage: &VmStorageAttachment) -> Result<(), String> {
+    let path = storage.path();
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("{name} not found at {}: {err}", path.display()))?;
+    if storage.requires_regular_file() && !metadata.is_file() {
+        return Err(format!("{name} must be a regular file: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn libkrun_host_file_path<'a>(
+    name: &str,
+    storage: &'a VmStorageAttachment,
+) -> Result<&'a Path, String> {
+    let VmStorageAttachment::HostFile { path, .. } = storage else {
+        return Err(format!("{name} must be a host file for libkrun"));
+    };
+    validate_storage_attachment(name, storage)?;
+    Ok(path)
 }
 
 /// Write environment variables into the overlay disk so the guest init script
@@ -269,9 +420,7 @@ fn write_guest_env_file(overlay_disk: &Path, env_vars: &[String]) -> Result<(), 
 fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> Vec<String> {
     let mut env_vars = config.env.clone();
 
-    if let Some(ip) = &config.guest_ip
-        && let Some(host_ip) = &config.host_ip
-    {
+    if let Some((ip, host_ip)) = first_tap_guest_host_ips(&config.network) {
         env_vars.push(format!("VM_NET_IP={ip}"));
         env_vars.push(format!("VM_NET_GW={host_ip}"));
     }
@@ -280,7 +429,7 @@ fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> V
         env_vars.push(format!("VM_NET_DNS={dns}"));
     }
 
-    if config.gpu_bdf.is_some() {
+    if has_gpu_attachment(&config.devices) {
         env_vars.push("GPU_ENABLED=true".to_string());
     }
 
@@ -307,17 +456,37 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
         format!("init={}", config.exec_path),
     ];
 
-    if let Some(ip) = &config.guest_ip
-        && let Some(host_ip) = &config.host_ip
-    {
+    if let Some((ip, host_ip)) = first_tap_guest_host_ips(&config.network) {
         parts.push(format!("ip={ip}::{host_ip}:255.255.255.252:sandbox::off"));
     }
 
-    if config.gpu_bdf.is_some() {
+    if has_gpu_attachment(&config.devices) {
         parts.push("firmware_class.path=/lib/firmware".to_string());
     }
 
     parts.join(" ")
+}
+
+fn first_tap_guest_host_ips(networks: &[VmNetworkAttachment]) -> Option<(&str, &str)> {
+    networks.iter().find_map(|network| {
+        if let VmNetworkAttachment::Tap {
+            guest_ip, host_ip, ..
+        } = network
+        {
+            Some((guest_ip.as_str(), host_ip.as_str()))
+        } else {
+            None
+        }
+    })
+}
+
+fn has_gpu_attachment(devices: &[VmDeviceAttachment]) -> bool {
+    devices.iter().any(|device| {
+        matches!(
+            device,
+            VmDeviceAttachment::VfioPci { id: Some(id), .. } if id == "gpu"
+        )
+    })
 }
 
 fn host_dns_server() -> Option<String> {
@@ -648,23 +817,14 @@ fn procguard_kill_children() {
 }
 
 fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    if !config.root_disk.is_file() {
-        return Err(format!(
-            "root disk image not found: {}",
-            config.root_disk.display()
-        ));
-    }
-    if !config.overlay_disk.is_file() {
-        return Err(format!(
-            "overlay disk image not found: {}",
-            config.overlay_disk.display()
-        ));
-    }
-    if let Some(image_disk) = &config.image_disk
-        && !image_disk.is_file()
-    {
-        return Err(format!("image disk not found: {}", image_disk.display()));
-    }
+    let root_disk = libkrun_host_file_path("root disk", &config.rootfs.root)?;
+    let overlay_disk = libkrun_host_file_path("overlay disk", &config.rootfs.overlay)?;
+    let image_disk = config
+        .rootfs
+        .image
+        .as_ref()
+        .map(|image| libkrun_host_file_path("image disk", image))
+        .transpose()?;
 
     // Arm procguard first, BEFORE we spawn gvproxy or fork libkrun, so
     // that the launcher can't be orphaned during setup. The cleanup
@@ -687,11 +847,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     let vm = VmContext::create(&runtime_dir, config.log_level)?;
     vm.set_vm_config(config.vcpus, config.mem_mib)?;
-    vm.set_disks(
-        &config.root_disk,
-        &config.overlay_disk,
-        config.image_disk.as_deref(),
-    )?;
+    vm.set_disks(root_disk, overlay_disk, image_disk)?;
     vm.set_workdir(&config.workdir)?;
 
     // Run gvproxy strictly as the guest's virtual NIC / DHCP / router.
@@ -738,12 +894,12 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             ));
         }
 
-        let sock_base = gvproxy_socket_base(&config.overlay_disk)?;
+        let sock_base = gvproxy_socket_base(overlay_disk)?;
         let net_sock = sock_base.with_extension("v");
         let _ = std::fs::remove_file(&net_sock);
         let _ = std::fs::remove_file(sock_base.with_extension("v-krun.sock"));
 
-        let run_dir = config.overlay_disk.parent().unwrap_or(&config.overlay_disk);
+        let run_dir = overlay_disk.parent().unwrap_or(overlay_disk);
         let gvproxy_log = run_dir.join("gvproxy.log");
         let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
             .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
@@ -1394,9 +1550,11 @@ mod tests {
 
     fn qemu_config() -> VmLaunchConfig {
         VmLaunchConfig {
-            root_disk: PathBuf::from("/rootfs.ext4"),
-            overlay_disk: PathBuf::from("/overlay.ext4"),
-            image_disk: None,
+            rootfs: VmRootfsConfig::host_files(
+                PathBuf::from("/rootfs.ext4"),
+                PathBuf::from("/overlay.ext4"),
+                None,
+            ),
             vcpus: 2,
             mem_mib: 2048,
             exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),
@@ -1406,13 +1564,20 @@ mod tests {
             log_level: 0,
             console_output: PathBuf::from("/console.log"),
             backend: VmBackend::Qemu,
-            gpu_bdf: Some("0000:01:00.0".to_string()),
-            tap_device: Some("vmtap-test".to_string()),
-            guest_ip: Some("10.0.128.2".to_string()),
-            host_ip: Some("10.0.128.1".to_string()),
-            vsock_cid: Some(4),
-            guest_mac: Some("02:00:00:00:00:01".to_string()),
-            gateway_port: Some(8080),
+            network: vec![VmNetworkAttachment::Tap {
+                ifname: "vmtap-test".to_string(),
+                guest_ip: "10.0.128.2".to_string(),
+                host_ip: "10.0.128.1".to_string(),
+                mac: "02:00:00:00:00:01".to_string(),
+                gateway_port: Some(8080),
+            }],
+            devices: vec![
+                VmDeviceAttachment::VfioPci {
+                    bdf: "0000:01:00.0".to_string(),
+                    id: Some("gpu".to_string()),
+                },
+                VmDeviceAttachment::Vsock { cid: 4 },
+            ],
         }
     }
 
@@ -1425,6 +1590,21 @@ mod tests {
         assert!(env.contains(&"VM_NET_GW=10.0.128.1".to_string()));
         assert!(env.contains(&"VM_NET_DNS=1.1.1.1".to_string()));
         assert!(env.contains(&"GPU_ENABLED=true".to_string()));
+    }
+
+    #[test]
+    fn qemu_guest_env_vars_omit_gpu_flag_without_gpu() {
+        let mut config = qemu_config();
+        config.devices.retain(|device| {
+            !matches!(
+                device,
+                VmDeviceAttachment::VfioPci { id: Some(id), .. } if id == "gpu"
+            )
+        });
+
+        let env = qemu_guest_env_vars(&config, Some("1.1.1.1".to_string()));
+
+        assert!(!env.contains(&"GPU_ENABLED=true".to_string()));
     }
 
     #[test]
@@ -1444,7 +1624,7 @@ mod tests {
 
     #[test]
     fn qemu_disk_args_attach_base_readonly_and_overlay_readwrite() {
-        let args = qemu_disk_args(&qemu_config());
+        let args = qemu_disk_args(&qemu_config().rootfs);
 
         assert!(args.contains(&"-drive".to_string()));
         assert!(
@@ -1465,14 +1645,71 @@ mod tests {
     #[test]
     fn qemu_disk_args_attach_prepared_image_readonly_when_present() {
         let mut config = qemu_config();
-        config.image_disk = Some(PathBuf::from("/image-rootfs.ext4"));
+        config.rootfs.image = Some(VmStorageAttachment::host_file(
+            PathBuf::from("/image-rootfs.ext4"),
+            true,
+        ));
 
-        let args = qemu_disk_args(&config);
+        let args = qemu_disk_args(&config.rootfs);
 
         assert!(args.contains(
             &"file=/image-rootfs.ext4,if=none,format=raw,id=image,readonly=on".to_string()
         ));
         assert!(args.contains(&"virtio-blk-pci,drive=image".to_string()));
+    }
+
+    #[test]
+    fn qemu_disk_args_support_dpu_provisioned_rootfs() {
+        let rootfs = VmRootfsConfig {
+            root: VmStorageAttachment::DpuProvisioned {
+                id: "bf-rootfs-1".to_string(),
+                device: PathBuf::from("/dev/disk/by-id/dpu-rootfs"),
+                read_only: true,
+            },
+            overlay: VmStorageAttachment::host_file(PathBuf::from("/overlay.ext4"), false),
+            image: None,
+        };
+
+        let args = qemu_disk_args(&rootfs);
+
+        assert!(args.contains(
+            &"file=/dev/disk/by-id/dpu-rootfs,if=none,format=raw,id=rootfs,readonly=on".to_string()
+        ));
+        assert!(args.contains(&"virtio-blk-pci,drive=rootfs".to_string()));
+    }
+
+    #[test]
+    fn qemu_network_args_support_vfio_and_vdpa() {
+        let args = qemu_network_args(&[
+            VmNetworkAttachment::VfioPci {
+                bdf: "0000:03:00.2".to_string(),
+                mac: None,
+            },
+            VmNetworkAttachment::Vdpa {
+                device: PathBuf::from("/dev/vhost-vdpa-0"),
+                mac: Some("02:00:00:00:00:02".to_string()),
+            },
+        ]);
+
+        assert!(args.contains(&"vfio-pci,host=0000:03:00.2,bus=net_root0".to_string()));
+        assert!(args.contains(&"vhost-vdpa,id=net1,vhostdev=/dev/vhost-vdpa-0".to_string()));
+        assert!(args.contains(
+            &"virtio-net-pci,netdev=net1,bus=net_root1,mac=02:00:00:00:00:02".to_string()
+        ));
+    }
+
+    #[test]
+    fn qemu_device_args_support_vfio_and_vsock() {
+        let args = qemu_device_args(&[
+            VmDeviceAttachment::VfioPci {
+                bdf: "0000:01:00.0".to_string(),
+                id: Some("gpu".to_string()),
+            },
+            VmDeviceAttachment::Vsock { cid: 4 },
+        ]);
+
+        assert!(args.contains(&"vfio-pci,host=0000:01:00.0,bus=dev_root0".to_string()));
+        assert!(args.contains(&"vhost-vsock-pci,guest-cid=4,bus=vsock_root1".to_string()));
     }
 
     #[test]

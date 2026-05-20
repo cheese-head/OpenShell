@@ -153,6 +153,67 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
+## Runtime Backend Selection
+
+VM sandboxes use libkrun by default. A sandbox may request the QEMU backend by
+setting `template.platform_config.runtime_class_name` to `qemu`; `libkrun`
+selects the default libkrun backend explicitly.
+
+Supported VM runtime classes:
+
+| `template.platform_config.runtime_class_name` | Backend |
+|---|---|
+| empty | libkrun, unless `gpu=true` requires QEMU |
+| `libkrun` | libkrun |
+| `qemu` | QEMU |
+
+GPU passthrough still uses QEMU. A sandbox with `gpu=true` and an empty runtime
+class is launched with QEMU for compatibility with earlier VM driver behavior.
+`gpu=true` with `runtime_class_name=libkrun` is rejected because libkrun GPU
+passthrough is not supported by this driver.
+
+QEMU sandboxes use TAP networking and KVM. On Linux this requires access to
+`/dev/kvm`, `qemu-system-x86_64`, and enough host privileges for TAP/nftables
+network setup. GPU-backed QEMU additionally requires VFIO/IOMMU setup and a
+driver started with GPU support enabled.
+
+## VM Lifecycle Extensions
+
+The VM driver exposes a VM-local lifecycle extension API for code that needs to
+adjust host-side VM launch behavior without changing the compute-driver gRPC
+contract. Extensions are registered in-process through the `VmLifecycleExtensions`
+registry on `VmDriverConfig`; no extensions are configured by the default
+`openshell-driver-vm` binary, so default VM behavior is unchanged.
+
+Extensions receive a `VmLifecycleContext` and a `VmLaunchPlan`. The plan is the
+driver-owned launch boundary: disks, backend, CPU/memory, guest environment,
+console output, typed rootfs/storage attachments, typed network attachments,
+typed device attachments, and extra launcher arguments. Extensions may adjust
+supported launch-plan fields before the launcher process starts, but the
+selected backend is fixed by `template.platform_config.runtime_class_name` and
+GPU requirements.
+
+QEMU launch plans can represent TAP networking, VFIO PCI network functions,
+vDPA devices, generic VFIO PCI devices, vhost-vsock devices, and host- or
+DPU-provisioned rootfs storage. The default VM driver still constructs the same
+host-file rootfs plus TAP/vsock plan as before; hardware-specific extensions can
+replace those typed attachments without relying on raw QEMU argument injection.
+
+Available hooks:
+
+| Hook | Purpose |
+|---|---|
+| `before_vm_launch` | Inspect or mutate the launch plan before spawning the VM launcher. |
+| `after_vm_launch_succeeded` | Run after the launcher process has spawned successfully. |
+| `after_vm_launch_failed` | Observe launch failure or cancellation and clean up extension state. |
+| `after_sandbox_deleted` | Run during sandbox deletion before the sandbox state directory is removed. |
+| `reconcile_before_restore` | Inspect persisted state before restoring a sandbox after driver restart. |
+| `reconcile_after_restore` | Run after a persisted sandbox has been accepted for restore. |
+
+Extension state is persisted as JSON under
+`<state-dir>/sandboxes/<sandbox-id>/extensions/<extension-name>.json`.
+Extension names must match `[A-Za-z0-9._-]{1,128}`.
+
 ## Verifying the gateway
 
 The gateway is auto-registered by `mise run gateway:vm`. In another terminal:

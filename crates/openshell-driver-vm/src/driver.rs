@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::extension::{
+    LaunchAbortReason, ReconcileOutcome, VmLaunchPlan, VmLifecycleError, VmLifecycleExtensions,
+};
 use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
+use crate::platform_config::sandbox_launch_backend;
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
     extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
     set_rootfs_image_file_mode, write_rootfs_image_file,
 };
+use crate::runtime::{VmBackend, VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig};
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
@@ -169,6 +174,7 @@ pub struct VmDriverConfig {
     pub gpu_enabled: bool,
     pub gpu_mem_mib: u32,
     pub gpu_vcpus: u8,
+    pub lifecycle_extensions: VmLifecycleExtensions,
 }
 
 impl Default for VmDriverConfig {
@@ -190,6 +196,7 @@ impl Default for VmDriverConfig {
             gpu_enabled: false,
             gpu_mem_mib: 8192,
             gpu_vcpus: 4,
+            lifecycle_extensions: VmLifecycleExtensions::default(),
         }
     }
 }
@@ -279,6 +286,7 @@ struct SandboxRecord {
     process: Option<Arc<Mutex<VmProcess>>>,
     provisioning_task: Option<JoinHandle<()>>,
     gpu_bdf: Option<String>,
+    backend: Option<VmBackend>,
     deleting: bool,
 }
 
@@ -306,6 +314,10 @@ impl VmDriver {
         }
         validate_openshell_endpoint(&config.openshell_endpoint)?;
         let _ = config.tls_paths()?;
+        config
+            .lifecycle_extensions
+            .validate()
+            .map_err(|err| err.to_string())?;
 
         #[cfg(target_os = "linux")]
         if config.gpu_enabled {
@@ -437,6 +449,7 @@ impl VmDriver {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
+                    backend: None,
                     deleting: false,
                 },
             );
@@ -614,6 +627,7 @@ impl VmDriver {
 
         let spec = sandbox.spec.as_ref();
         let is_gpu = spec.is_some_and(|s| s.gpu);
+        let launch_backend = sandbox_launch_backend(&sandbox)?;
         let gpu_device = spec.map_or("", |s| s.gpu_device.as_str());
         let gpu_bdf = if is_gpu {
             Some(self.assign_gpu_to_record(&sandbox.id, gpu_device).await?)
@@ -622,24 +636,25 @@ impl VmDriver {
         };
 
         let console_output = state_dir.join("rootfs-console.log");
-        let mut command = Command::new(&self.launcher_bin);
-        command.kill_on_drop(true);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
-        command.arg("--internal-run-vm");
-        command.arg("--vm-root-disk").arg(&root_disk);
-        command.arg("--vm-overlay-disk").arg(&overlay_disk);
-        if let Some(image_disk) = &image_disk {
-            command.arg("--vm-image-disk").arg(image_disk);
-        }
-        command.arg("--vm-exec").arg(sandbox_guest_init_path());
-        command.arg("--vm-workdir").arg("/");
-        command.arg("--vm-console-output").arg(&console_output);
+
+        let mut plan = VmLaunchPlan {
+            rootfs: VmRootfsConfig::host_files(root_disk, overlay_disk, image_disk),
+            exec_path: sandbox_guest_init_path().to_string(),
+            workdir: "/".to_string(),
+            console_output,
+            vcpus: self.config.vcpus,
+            mem_mib: self.config.mem_mib,
+            krun_log_level: self.config.krun_log_level,
+            env: Vec::new(),
+            backend: VmBackend::Libkrun,
+            network: Vec::new(),
+            devices: Vec::new(),
+            extra_launcher_args: Vec::new(),
+        };
 
         // Compute the endpoint override before building the env so
         // there is a single OPENSHELL_ENDPOINT value in the env list.
-        let endpoint_override = if let Some(bdf) = gpu_bdf.as_ref() {
+        let endpoint_override = if launch_backend == VmBackend::Qemu {
             let subnet = match self
                 .subnet_allocator
                 .lock()
@@ -668,51 +683,99 @@ impl VmDriver {
                 &subnet.host_ip.to_string(),
             );
 
-            command.arg("--vm-backend").arg("qemu");
-            command
-                .arg("--vm-vcpus")
-                .arg(self.config.gpu_vcpus.to_string());
-            command
-                .arg("--vm-mem-mib")
-                .arg(self.config.gpu_mem_mib.to_string());
-            command.arg("--vm-gpu-bdf").arg(bdf);
-            command.arg("--vm-tap-device").arg(&tap);
-            command
-                .arg("--vm-guest-ip")
-                .arg(subnet.guest_ip.to_string());
-            command.arg("--vm-host-ip").arg(subnet.host_ip.to_string());
-            command.arg("--vm-vsock-cid").arg(vsock_cid.to_string());
-            command.arg("--vm-guest-mac").arg(&mac_str);
-
-            if let Some(port) = gateway_port_from_endpoint(&self.config.openshell_endpoint) {
-                command.arg("--vm-gateway-port").arg(port.to_string());
+            plan.backend = VmBackend::Qemu;
+            if gpu_bdf.is_some() {
+                plan.vcpus = self.config.gpu_vcpus;
+                plan.mem_mib = self.config.gpu_mem_mib;
+            }
+            plan.network.push(VmNetworkAttachment::Tap {
+                ifname: tap,
+                guest_ip: subnet.guest_ip.to_string(),
+                host_ip: subnet.host_ip.to_string(),
+                mac: mac_str,
+                gateway_port: gateway_port_from_endpoint(&self.config.openshell_endpoint),
+            });
+            plan.devices
+                .push(VmDeviceAttachment::Vsock { cid: vsock_cid });
+            if let Some(gpu_bdf) = &gpu_bdf {
+                plan.devices.push(VmDeviceAttachment::VfioPci {
+                    bdf: gpu_bdf.clone(),
+                    id: Some("gpu".to_string()),
+                });
             }
 
             Some(tap_endpoint)
         } else {
-            command.arg("--vm-vcpus").arg(self.config.vcpus.to_string());
-            command
-                .arg("--vm-mem-mib")
-                .arg(self.config.mem_mib.to_string());
             None
         };
         self.ensure_provisioning_active(&sandbox.id).await?;
 
-        command
-            .arg("--vm-krun-log-level")
-            .arg(self.config.krun_log_level.to_string());
+        plan.env = build_guest_environment(&sandbox, &self.config, endpoint_override.as_deref());
+        let allocated_backend = plan.backend.clone();
 
-        for env in build_guest_environment(&sandbox, &self.config, endpoint_override.as_deref()) {
-            command.arg("--vm-env").arg(env);
+        if let Err(err) = self
+            .config
+            .lifecycle_extensions
+            .before_vm_launch(&sandbox, &state_dir, &image_ref, &mut plan)
+            .await
+        {
+            let reason = LaunchAbortReason::ExtensionHookFailed {
+                hook: "before_vm_launch".to_string(),
+                message: err.message().to_string(),
+            };
+            self.config
+                .lifecycle_extensions
+                .after_vm_launch_failed(&sandbox, &state_dir, &image_ref, &plan, &reason)
+                .await;
+            if launch_backend == VmBackend::Qemu {
+                self.release_gpu_and_subnet(&sandbox.id);
+            }
+            return Err(lifecycle_status(&err));
         }
+
+        if plan.backend != allocated_backend {
+            let err = Status::failed_precondition(
+                "vm lifecycle extensions cannot change the selected VM backend",
+            );
+            let reason = LaunchAbortReason::ExtensionHookFailed {
+                hook: "before_vm_launch".to_string(),
+                message: err.message().to_string(),
+            };
+            self.config
+                .lifecycle_extensions
+                .after_vm_launch_failed(&sandbox, &state_dir, &image_ref, &plan, &reason)
+                .await;
+            if launch_backend == VmBackend::Qemu {
+                self.release_gpu_and_subnet(&sandbox.id);
+            }
+            return Err(err);
+        }
+
+        let mut command = match self.launch_command_from_plan(&plan) {
+            Ok(command) => command,
+            Err(err) => {
+                let reason = LaunchAbortReason::ExtensionHookFailed {
+                    hook: "launch_plan_validation".to_string(),
+                    message: err.message().to_string(),
+                };
+                self.config
+                    .lifecycle_extensions
+                    .after_vm_launch_failed(&sandbox, &state_dir, &image_ref, &plan, &reason)
+                    .await;
+                if launch_backend == VmBackend::Qemu {
+                    self.release_gpu_and_subnet(&sandbox.id);
+                }
+                return Err(err);
+            }
+        };
 
         info!(
             sandbox_id = %sandbox.id,
             launcher = %self.launcher_bin.display(),
-            console_output = %console_output.display(),
+            console_output = %plan.console_output.display(),
             "vm driver: spawning VM launcher"
         );
-        let child = match command.spawn() {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 warn!(
@@ -720,7 +783,14 @@ impl VmDriver {
                     error = %err,
                     "vm driver: launcher spawn failed"
                 );
-                if gpu_bdf.is_some() {
+                let reason = LaunchAbortReason::LauncherSpawnFailed {
+                    message: err.to_string(),
+                };
+                self.config
+                    .lifecycle_extensions
+                    .after_vm_launch_failed(&sandbox, &state_dir, &image_ref, &plan, &reason)
+                    .await;
+                if launch_backend == VmBackend::Qemu {
                     self.release_gpu_and_subnet(&sandbox.id);
                 }
                 return Err(Status::internal(format!(
@@ -732,8 +802,36 @@ impl VmDriver {
         info!(
             sandbox_id = %sandbox.id,
             launcher_pid = child.id().unwrap_or(0),
-                "vm driver: launcher spawned"
+            "vm driver: launcher spawned"
         );
+
+        if let Err(err) = self
+            .config
+            .lifecycle_extensions
+            .after_vm_launch_succeeded(&sandbox, &state_dir, &image_ref, &plan)
+            .await
+        {
+            let reason = LaunchAbortReason::ExtensionHookFailed {
+                hook: "after_vm_launch_succeeded".to_string(),
+                message: err.message().to_string(),
+            };
+            self.config
+                .lifecycle_extensions
+                .after_vm_launch_failed(&sandbox, &state_dir, &image_ref, &plan, &reason)
+                .await;
+            if let Err(stop_err) = terminate_vm_process(&mut child).await {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %stop_err,
+                    "vm driver: failed to stop launcher after lifecycle hook failure"
+                );
+            }
+            if launch_backend == VmBackend::Qemu {
+                self.release_gpu_and_subnet(&sandbox.id);
+            }
+            return Err(lifecycle_status(&err));
+        }
+
         let process = Arc::new(Mutex::new(VmProcess {
             child,
             deleting: false,
@@ -747,6 +845,7 @@ impl VmDriver {
                 Some(record) if !record.deleting => {
                     record.process = Some(process.clone());
                     record.gpu_bdf.clone_from(&gpu_bdf);
+                    record.backend = Some(plan.backend.clone());
                     record.provisioning_task = None;
                     snapshot_to_publish = Some(record.snapshot.clone());
                 }
@@ -764,6 +863,16 @@ impl VmDriver {
                     .await
                     .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
             }
+            self.config
+                .lifecycle_extensions
+                .after_vm_launch_failed(
+                    &sandbox,
+                    &state_dir,
+                    &image_ref,
+                    &plan,
+                    &LaunchAbortReason::ProvisioningCancelled,
+                )
+                .await;
             self.release_gpu_and_subnet(&sandbox.id);
             return Err(Status::cancelled("sandbox provisioning cancelled"));
         }
@@ -811,25 +920,28 @@ impl VmDriver {
             return Ok(DeleteSandboxResponse { deleted: false });
         };
 
-        let (state_dir, process, gpu_bdf, provisioning_task) = {
+        let (mut snapshot, state_dir, process, gpu_bdf, backend, provisioning_task) = {
             let mut registry = self.registry.lock().await;
             let Some(record) = registry.get_mut(&record_id) else {
                 return Ok(DeleteSandboxResponse { deleted: false });
             };
             record.deleting = true;
             (
+                record.snapshot.clone(),
                 record.state_dir.clone(),
                 record.process.clone(),
                 record.gpu_bdf.clone(),
+                record.backend.clone(),
                 record.provisioning_task.take(),
             )
         };
 
-        if let Some(snapshot) = self
+        if let Some(deleting_snapshot) = self
             .set_snapshot_condition(&record_id, deleting_condition(), true)
             .await
         {
-            self.publish_snapshot(snapshot);
+            self.publish_snapshot(deleting_snapshot.clone());
+            snapshot = deleting_snapshot;
         }
 
         if let Some(task) = provisioning_task {
@@ -844,9 +956,15 @@ impl VmDriver {
                 .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
         }
 
-        if gpu_bdf.is_some() {
+        if gpu_bdf.is_some() || backend == Some(VmBackend::Qemu) {
             self.release_gpu_and_subnet(&record_id);
         }
+
+        self.config
+            .lifecycle_extensions
+            .after_sandbox_deleted(&snapshot, &state_dir)
+            .await
+            .map_err(|err| lifecycle_status(&err))?;
 
         remove_sandbox_state_dir(&self.config.state_dir, &state_dir).await?;
 
@@ -962,6 +1080,34 @@ impl VmDriver {
                 continue;
             }
 
+            match self
+                .config
+                .lifecycle_extensions
+                .reconcile_before_restore(&sandbox, &state_dir)
+                .await
+                .map_err(|err| lifecycle_status(&err))
+            {
+                Ok(ReconcileOutcome::Continue) => {}
+                Ok(ReconcileOutcome::SkipRestore { reason }) => {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        state_dir = %state_dir.display(),
+                        reason = %reason,
+                        "vm driver: lifecycle extension skipped persisted sandbox restore"
+                    );
+                    continue;
+                }
+                Err(status) => {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        state_dir = %state_dir.display(),
+                        error = %status.message(),
+                        "vm driver: lifecycle extension rejected persisted sandbox restore"
+                    );
+                    continue;
+                }
+            }
+
             self.restore_persisted_sandbox(sandbox, state_dir).await;
         }
     }
@@ -1002,6 +1148,7 @@ impl VmDriver {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
+                    backend: None,
                     deleting: false,
                 },
             );
@@ -1019,6 +1166,8 @@ impl VmDriver {
         self.publish_snapshot(snapshot);
 
         let driver = self.clone();
+        let sandbox_for_reconcile = sandbox.clone();
+        let state_dir_for_reconcile = state_dir.clone();
         let sandbox_id = sandbox.id.clone();
         let task = tokio::spawn(async move {
             driver
@@ -1042,6 +1191,21 @@ impl VmDriver {
         } else {
             task.abort();
         }
+
+        if let Err(status) = self
+            .config
+            .lifecycle_extensions
+            .reconcile_after_restore(&sandbox_for_reconcile, &state_dir_for_reconcile)
+            .await
+            .map_err(|err| lifecycle_status(&err))
+        {
+            warn!(
+                sandbox_id = %sandbox_for_reconcile.id,
+                state_dir = %state_dir_for_reconcile.display(),
+                error = %status.message(),
+                "vm driver: lifecycle extension failed after persisted sandbox restore"
+            );
+        }
     }
 
     fn release_gpu_and_subnet(&self, sandbox_id: &str) {
@@ -1053,6 +1217,58 @@ impl VmDriver {
         if let Ok(mut alloc) = self.subnet_allocator.lock() {
             alloc.release(sandbox_id);
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn launch_command_from_plan(&self, plan: &VmLaunchPlan) -> Result<Command, Status> {
+        plan.validate()
+            .map_err(|err| Status::failed_precondition(format!("invalid VM launch plan: {err}")))?;
+
+        let mut command = Command::new(&self.launcher_bin);
+        command.kill_on_drop(true);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::inherit());
+        command.stderr(Stdio::inherit());
+        command.arg("--internal-run-vm");
+        command
+            .arg("--vm-rootfs-config")
+            .arg(serde_json::to_string(&plan.rootfs).map_err(|err| {
+                Status::internal(format!("serialize VM rootfs config failed: {err}"))
+            })?);
+        command.arg("--vm-exec").arg(&plan.exec_path);
+        command.arg("--vm-workdir").arg(&plan.workdir);
+        command.arg("--vm-console-output").arg(&plan.console_output);
+        command.arg("--vm-vcpus").arg(plan.vcpus.to_string());
+        command.arg("--vm-mem-mib").arg(plan.mem_mib.to_string());
+        command
+            .arg("--vm-krun-log-level")
+            .arg(plan.krun_log_level.to_string());
+        match plan.backend {
+            VmBackend::Libkrun => {}
+            VmBackend::Qemu => {
+                command.arg("--vm-backend").arg("qemu");
+            }
+        }
+        for network in &plan.network {
+            command
+                .arg("--vm-network-attachment")
+                .arg(serde_json::to_string(network).map_err(|err| {
+                    Status::internal(format!("serialize VM network attachment failed: {err}"))
+                })?);
+        }
+        for device in &plan.devices {
+            command
+                .arg("--vm-device-attachment")
+                .arg(serde_json::to_string(device).map_err(|err| {
+                    Status::internal(format!("serialize VM device attachment failed: {err}"))
+                })?);
+        }
+
+        for env in &plan.env {
+            command.arg("--vm-env").arg(env);
+        }
+        command.args(&plan.extra_launcher_args);
+        Ok(command)
     }
 
     async fn ensure_provisioning_active(&self, sandbox_id: &str) -> Result<(), Status> {
@@ -1118,6 +1334,7 @@ impl VmDriver {
             record.process = None;
             record.provisioning_task = None;
             record.gpu_bdf = None;
+            record.backend = None;
             record.snapshot.status = Some(status_with_condition(
                 &record.snapshot,
                 error_condition(reason, message),
@@ -2334,14 +2551,13 @@ impl VmDriver {
                     sandbox_id.clone(),
                     platform_event("vm", "Warning", "ProcessExited", message),
                 );
-                let has_gpu = {
+                let uses_qemu = {
                     let registry = self.registry.lock().await;
                     registry
                         .get(&sandbox_id)
-                        .and_then(|r| r.gpu_bdf.as_ref())
-                        .is_some()
+                        .is_some_and(|r| r.backend == Some(VmBackend::Qemu))
                 };
-                if has_gpu {
+                if uses_qemu {
                     self.release_gpu_and_subnet(&sandbox_id);
                 }
                 return;
@@ -2561,6 +2777,10 @@ fn check_gpu_privileges() -> Result<(), String> {
     Ok(())
 }
 
+fn lifecycle_status(err: &VmLifecycleError) -> Status {
+    Status::failed_precondition(err.to_string())
+}
+
 // `tonic::Status` is ~176 bytes; it's the standard error type across the
 // gRPC API surface, so boxing here would diverge from every other handler.
 #[allow(clippy::result_large_err)]
@@ -2582,17 +2802,14 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
         return Err(Status::invalid_argument("gpu_device requires gpu=true"));
     }
 
-    if let Some(template) = spec.template.as_ref() {
-        if !template.agent_socket_path.is_empty() {
-            return Err(Status::failed_precondition(
-                "vm sandboxes do not support template.agent_socket_path",
-            ));
-        }
-        if template.platform_config.is_some() {
-            return Err(Status::failed_precondition(
-                "vm sandboxes do not support template.platform_config",
-            ));
-        }
+    let _ = sandbox_launch_backend(sandbox)?;
+
+    if let Some(template) = spec.template.as_ref()
+        && !template.agent_socket_path.is_empty()
+    {
+        return Err(Status::failed_precondition(
+            "vm sandboxes do not support template.agent_socket_path",
+        ));
     }
     Ok(())
 }
@@ -4378,6 +4595,10 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::{
+        PersistedExtensionState, VmLifecycleContext, VmLifecycleError, VmLifecycleExtension,
+        VmLifecycleExtensions, VmLifecycleHookResult, VmLifecycleResult, extension_state_path,
+    };
     use crate::gpu::{SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name};
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -4387,8 +4608,10 @@ mod tests {
         DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate,
     };
     use prost_types::{Struct, Value, value::Kind};
+    use serde_json::json;
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
@@ -4502,7 +4725,33 @@ mod tests {
     }
 
     #[test]
-    fn validate_vm_sandbox_rejects_platform_config() {
+    fn validate_vm_sandbox_accepts_qemu_runtime_class() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    platform_config: Some(Struct {
+                        fields: std::iter::once((
+                            "runtime_class_name".to_string(),
+                            Value {
+                                kind: Some(Kind::StringValue("qemu".to_string())),
+                            },
+                        ))
+                        .collect(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vm_sandbox(&sandbox, false).expect("qemu runtime class should be accepted");
+        assert_eq!(sandbox_launch_backend(&sandbox).unwrap(), VmBackend::Qemu);
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_unsupported_runtime_class() {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
@@ -4522,10 +4771,81 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err =
-            validate_vm_sandbox(&sandbox, false).expect_err("platform config should be rejected");
+        let err = validate_vm_sandbox(&sandbox, false)
+            .expect_err("unsupported runtime class should be rejected");
         assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("platform_config"));
+        assert!(err.message().contains("runtime_class_name"));
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_unsupported_platform_config_field() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    platform_config: Some(Struct {
+                        fields: std::iter::once((
+                            "annotations".to_string(),
+                            Value {
+                                kind: Some(Kind::StructValue(Struct::default())),
+                            },
+                        ))
+                        .collect(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vm_sandbox(&sandbox, false)
+            .expect_err("unsupported platform config fields should be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("annotations"));
+    }
+
+    #[test]
+    fn gpu_sandbox_with_empty_runtime_class_uses_qemu_backend() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(sandbox_launch_backend(&sandbox).unwrap(), VmBackend::Qemu);
+    }
+
+    #[test]
+    fn gpu_sandbox_rejects_explicit_libkrun_runtime_class() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: true,
+                template: Some(SandboxTemplate {
+                    platform_config: Some(Struct {
+                        fields: std::iter::once((
+                            "runtime_class_name".to_string(),
+                            Value {
+                                kind: Some(Kind::StringValue("libkrun".to_string())),
+                            },
+                        ))
+                        .collect(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = sandbox_launch_backend(&sandbox)
+            .expect_err("explicit libkrun runtime should be rejected for GPU sandboxes");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("GPU"));
     }
 
     #[test]
@@ -5200,6 +5520,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_extension_mutates_launch_plan_and_persists_state() {
+        let base = unique_temp_dir();
+        let state_dir = base.join("sandboxes").join("sandbox-123");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let extension = Arc::new(RecordingExtension {
+            name: "test-extension",
+            events: events.clone(),
+        });
+        let driver = test_driver_with_extensions(base.join("driver-state"), vec![extension]);
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let mut plan = minimal_launch_plan();
+
+        driver
+            .config
+            .lifecycle_extensions
+            .before_vm_launch(
+                &sandbox,
+                &state_dir,
+                "ghcr.io/example/sandbox:latest",
+                &mut plan,
+            )
+            .await
+            .expect("before launch hook should succeed");
+        driver
+            .config
+            .lifecycle_extensions
+            .after_vm_launch_succeeded(
+                &sandbox,
+                &state_dir,
+                "ghcr.io/example/sandbox:latest",
+                &plan,
+            )
+            .await
+            .expect("after launch hook should load persisted state");
+
+        assert!(plan.env.contains(&"EXTENSION_ENABLED=true".to_string()));
+        let state_path = extension_state_path(&state_dir, "test-extension").unwrap();
+        let persisted: PersistedExtensionState =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        assert_eq!(persisted.data["stage"], "after-success");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[
+                "before:ghcr.io/example/sandbox:latest",
+                "after-success:before-launch"
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_extension_failure_reports_hook_name() {
+        let base = unique_temp_dir();
+        let state_dir = base.join("sandboxes").join("sandbox-123");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let driver = test_driver_with_extensions(
+            base.join("driver-state"),
+            vec![Arc::new(FailingExtension {
+                name: "failing-extension",
+            })],
+        );
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let mut plan = minimal_launch_plan();
+
+        let err = driver
+            .config
+            .lifecycle_extensions
+            .before_vm_launch(
+                &sandbox,
+                &state_dir,
+                "ghcr.io/example/sandbox:latest",
+                &mut plan,
+            )
+            .await
+            .expect_err("failing hook should fail launch");
+
+        assert!(err.message().contains("failing-extension"));
+        assert!(err.message().contains("before_vm_launch"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn duplicate_lifecycle_extensions_are_rejected() {
+        let extensions: Vec<Arc<dyn VmLifecycleExtension>> = vec![
+            Arc::new(NamedExtension { name: "duplicate" }),
+            Arc::new(NamedExtension { name: "duplicate" }),
+        ];
+
+        let err = VmLifecycleExtensions::new(extensions)
+            .expect_err("duplicate extension names should be rejected");
+
+        assert!(err.message().contains("duplicate"));
+    }
+
+    #[tokio::test]
     async fn delete_sandbox_keeps_registry_entry_when_cleanup_fails() {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
@@ -5299,6 +5727,7 @@ mod tests {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
+                    backend: None,
                     deleting: false,
                 },
             );
@@ -5354,6 +5783,7 @@ mod tests {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
+                    backend: None,
                     deleting: false,
                 },
             );
@@ -5675,8 +6105,132 @@ mod tests {
                 process: Some(process),
                 provisioning_task: None,
                 gpu_bdf: None,
+                backend: None,
                 deleting: false,
             },
         );
+    }
+
+    fn test_driver_with_extensions(
+        state_dir: PathBuf,
+        lifecycle_extensions: Vec<Arc<dyn VmLifecycleExtension>>,
+    ) -> VmDriver {
+        VmDriver {
+            config: VmDriverConfig {
+                state_dir,
+                lifecycle_extensions: VmLifecycleExtensions::new(lifecycle_extensions)
+                    .expect("valid lifecycle extensions"),
+                ..Default::default()
+            },
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            image_cache_lock: Arc::new(Mutex::new(())),
+            events: broadcast::channel(WATCH_BUFFER).0,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
+        }
+    }
+
+    fn minimal_launch_plan() -> VmLaunchPlan {
+        VmLaunchPlan {
+            rootfs: VmRootfsConfig::host_files(
+                PathBuf::from("/tmp/root.ext4"),
+                PathBuf::from("/tmp/overlay.ext4"),
+                None,
+            ),
+            exec_path: "/init".to_string(),
+            workdir: "/".to_string(),
+            console_output: PathBuf::from("/tmp/console.log"),
+            vcpus: 2,
+            mem_mib: 2048,
+            krun_log_level: 1,
+            env: Vec::new(),
+            backend: VmBackend::Libkrun,
+            network: Vec::new(),
+            devices: Vec::new(),
+            extra_launcher_args: Vec::new(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingExtension {
+        name: &'static str,
+        events: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[tonic::async_trait]
+    impl VmLifecycleExtension for RecordingExtension {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn before_vm_launch(
+            &self,
+            context: &VmLifecycleContext<'_>,
+            plan: &mut VmLaunchPlan,
+        ) -> VmLifecycleResult<VmLifecycleHookResult> {
+            self.events.lock().unwrap().push(format!(
+                "before:{}",
+                context.image_ref.unwrap_or("missing-image")
+            ));
+            plan.env.push("EXTENSION_ENABLED=true".to_string());
+            Ok(VmLifecycleHookResult::with_state(
+                PersistedExtensionState::new(json!({ "stage": "before-launch" })),
+            ))
+        }
+
+        async fn after_vm_launch_succeeded(
+            &self,
+            context: &VmLifecycleContext<'_>,
+            _plan: &VmLaunchPlan,
+        ) -> VmLifecycleResult<VmLifecycleHookResult> {
+            let stage = context
+                .persisted_state(self.name)
+                .and_then(|state| state.data.get("stage"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing-state");
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("after-success:{stage}"));
+            Ok(VmLifecycleHookResult::with_state(
+                PersistedExtensionState::new(json!({ "stage": "after-success" })),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingExtension {
+        name: &'static str,
+    }
+
+    #[tonic::async_trait]
+    impl VmLifecycleExtension for FailingExtension {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn before_vm_launch(
+            &self,
+            _context: &VmLifecycleContext<'_>,
+            _plan: &mut VmLaunchPlan,
+        ) -> VmLifecycleResult<VmLifecycleHookResult> {
+            Err(VmLifecycleError::new("injected failure"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NamedExtension {
+        name: &'static str,
+    }
+
+    #[tonic::async_trait]
+    impl VmLifecycleExtension for NamedExtension {
+        fn name(&self) -> &str {
+            self.name
+        }
     }
 }

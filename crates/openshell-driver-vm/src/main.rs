@@ -8,7 +8,10 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
-use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
+use openshell_driver_vm::{
+    VmBackend, VmDeviceAttachment, VmDriver, VmDriverConfig, VmLaunchConfig, VmLifecycleExtensions,
+    VmNetworkAttachment, VmRootfsConfig, procguard, run_vm,
+};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -35,6 +38,9 @@ struct Args {
 
     #[arg(long = "vm-image-disk", hide = true)]
     vm_image_disk: Option<PathBuf>,
+
+    #[arg(long = "vm-rootfs-config", hide = true)]
+    vm_rootfs_config: Option<String>,
 
     #[arg(long, hide = true)]
     vm_exec: Option<String>,
@@ -152,6 +158,12 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_gateway_port: Option<u16>,
+
+    #[arg(long = "vm-network-attachment", hide = true)]
+    vm_network_attachment: Vec<String>,
+
+    #[arg(long = "vm-device-attachment", hide = true)]
+    vm_device_attachment: Vec<String>,
 }
 
 #[tokio::main]
@@ -211,6 +223,7 @@ async fn main() -> Result<()> {
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
+        lifecycle_extensions: VmLifecycleExtensions::default(),
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -454,15 +467,20 @@ impl Stream for AuthenticatedUnixIncoming {
 }
 
 fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, String> {
-    let root_disk = args
-        .vm_root_disk
-        .clone()
-        .ok_or_else(|| "--vm-root-disk is required in internal VM mode".to_string())?;
-    let overlay_disk = args
-        .vm_overlay_disk
-        .clone()
-        .ok_or_else(|| "--vm-overlay-disk is required in internal VM mode".to_string())?;
-    let image_disk = args.vm_image_disk.clone();
+    let rootfs = if let Some(config) = args.vm_rootfs_config.as_deref() {
+        serde_json::from_str::<VmRootfsConfig>(config)
+            .map_err(|err| format!("invalid --vm-rootfs-config: {err}"))?
+    } else {
+        let root_disk = args
+            .vm_root_disk
+            .clone()
+            .ok_or_else(|| "--vm-root-disk is required in internal VM mode".to_string())?;
+        let overlay_disk = args
+            .vm_overlay_disk
+            .clone()
+            .ok_or_else(|| "--vm-overlay-disk is required in internal VM mode".to_string())?;
+        VmRootfsConfig::host_files(root_disk, overlay_disk, args.vm_image_disk.clone())
+    };
     let exec_path = args
         .vm_exec
         .clone()
@@ -477,11 +495,11 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         Some("libkrun") | None => VmBackend::Libkrun,
         Some(other) => return Err(format!("unknown VM backend: {other}")),
     };
+    let network = vm_network_attachments(args)?;
+    let devices = vm_device_attachments(args)?;
 
     Ok(VmLaunchConfig {
-        root_disk,
-        overlay_disk,
-        image_disk,
+        rootfs,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
         exec_path,
@@ -491,14 +509,61 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         log_level: args.vm_krun_log_level,
         console_output,
         backend,
-        gpu_bdf: args.vm_gpu_bdf.clone(),
-        tap_device: args.vm_tap_device.clone(),
-        guest_ip: args.vm_guest_ip.clone(),
-        host_ip: args.vm_host_ip.clone(),
-        vsock_cid: args.vm_vsock_cid,
-        guest_mac: args.vm_guest_mac.clone(),
-        gateway_port: args.vm_gateway_port,
+        network,
+        devices,
     })
+}
+
+fn vm_network_attachments(args: &Args) -> std::result::Result<Vec<VmNetworkAttachment>, String> {
+    let mut attachments = parse_json_values::<VmNetworkAttachment>(
+        "--vm-network-attachment",
+        &args.vm_network_attachment,
+    )?;
+    if attachments.is_empty() && args.vm_tap_device.is_some() {
+        attachments.push(VmNetworkAttachment::Tap {
+            ifname: args.vm_tap_device.clone().unwrap_or_default(),
+            guest_ip: args.vm_guest_ip.clone().ok_or_else(|| {
+                "--vm-guest-ip is required with legacy --vm-tap-device".to_string()
+            })?,
+            host_ip: args.vm_host_ip.clone().ok_or_else(|| {
+                "--vm-host-ip is required with legacy --vm-tap-device".to_string()
+            })?,
+            mac: args.vm_guest_mac.clone().ok_or_else(|| {
+                "--vm-guest-mac is required with legacy --vm-tap-device".to_string()
+            })?,
+            gateway_port: args.vm_gateway_port,
+        });
+    }
+    Ok(attachments)
+}
+
+fn vm_device_attachments(args: &Args) -> std::result::Result<Vec<VmDeviceAttachment>, String> {
+    let mut attachments = parse_json_values::<VmDeviceAttachment>(
+        "--vm-device-attachment",
+        &args.vm_device_attachment,
+    )?;
+    if let Some(gpu_bdf) = &args.vm_gpu_bdf {
+        attachments.push(VmDeviceAttachment::VfioPci {
+            bdf: gpu_bdf.clone(),
+            id: Some("gpu".to_string()),
+        });
+    }
+    if let Some(cid) = args.vm_vsock_cid {
+        attachments.push(VmDeviceAttachment::Vsock { cid });
+    }
+    Ok(attachments)
+}
+
+fn parse_json_values<T>(flag: &str, values: &[String]) -> std::result::Result<Vec<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    values
+        .iter()
+        .map(|value| {
+            serde_json::from_str(value).map_err(|err| format!("invalid {flag} value: {err}"))
+        })
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
