@@ -1,0 +1,157 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.vm_attachment.v1;
+
+// VM attachment provider contract consumed by VM lifecycle extensions.
+//
+// The provider owns external resources for many OpenShell sandboxes: VF/vDPA
+// allocation, rootfs exposure, representor discovery, OVS/OpenFlow or
+// equivalent switch programming, and cleanup. The VM driver remains the host
+// QEMU launcher; it asks the provider for typed launch attachments and applies
+// them to its local VmLaunchPlan.
+service VmAttachmentProvider {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Attach(AttachRequest) returns (AttachResponse);
+  rpc Detach(DetachRequest) returns (DetachResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string message = 2;
+  repeated string capabilities = 3;
+}
+
+message AttachRequest {
+  string sandbox_id = 1;
+  string sandbox_name = 2;
+  optional string image_ref = 3;
+  string backend = 4;
+  VmRootfsConfig rootfs = 5;
+  repeated VmNetworkAttachment network = 6;
+  repeated VmDeviceAttachment devices = 7;
+}
+
+message AttachResponse {
+  VmAttachmentLease lease = 1;
+}
+
+message DetachRequest {
+  VmAttachmentLease lease = 1;
+}
+
+message DetachResponse {}
+
+message ListRequest {}
+
+message ListResponse {
+  repeated VmAttachmentLease leases = 1;
+}
+
+message ReconcileRequest {
+  VmAttachmentLease lease = 1;
+}
+
+message ReconcileResponse {
+  ReconcileOutcome outcome = 1;
+  string reason = 2;
+}
+
+enum ReconcileOutcome {
+  RECONCILE_OUTCOME_UNSPECIFIED = 0;
+  RECONCILE_OUTCOME_CONTINUE = 1;
+  RECONCILE_OUTCOME_SKIP_RESTORE = 2;
+}
+
+message VmAttachmentLease {
+  string attachment_id = 1;
+  uint64 generation = 2;
+  VmAttachmentPlan plan = 3;
+  map<string, string> metadata = 4;
+}
+
+message VmAttachmentPlan {
+  bool replace_network = 1;
+  repeated VmNetworkAttachment network = 2;
+  repeated VmDeviceAttachment devices = 3;
+  VmRootfsConfig rootfs = 4;
+  repeated string env = 5;
+}
+
+message VmRootfsConfig {
+  VmStorageAttachment root = 1;
+  VmStorageAttachment overlay = 2;
+  VmStorageAttachment image = 3;
+}
+
+message VmStorageAttachment {
+  oneof kind {
+    HostFileStorageAttachment host_file = 1;
+    HostBlockDeviceStorageAttachment host_block_device = 2;
+    ProviderProvisionedStorageAttachment provider_provisioned = 3;
+  }
+}
+
+message HostFileStorageAttachment {
+  string path = 1;
+  bool read_only = 2;
+}
+
+message HostBlockDeviceStorageAttachment {
+  string path = 1;
+  bool read_only = 2;
+}
+
+message ProviderProvisionedStorageAttachment {
+  string id = 1;
+  string device = 2;
+  bool read_only = 3;
+}
+
+message VmNetworkAttachment {
+  oneof kind {
+    TapNetworkAttachment tap = 1;
+    VfioPciNetworkAttachment vfio_pci = 2;
+    VdpaNetworkAttachment vdpa = 3;
+  }
+}
+
+message TapNetworkAttachment {
+  string ifname = 1;
+  string guest_ip = 2;
+  string host_ip = 3;
+  string mac = 4;
+  optional uint32 gateway_port = 5;
+}
+
+message VfioPciNetworkAttachment {
+  string bdf = 1;
+  optional string mac = 2;
+}
+
+message VdpaNetworkAttachment {
+  string device = 1;
+  optional string mac = 2;
+}
+
+message VmDeviceAttachment {
+  oneof kind {
+    VfioPciDeviceAttachment vfio_pci = 1;
+    VsockDeviceAttachment vsock = 2;
+  }
+}
+
+message VfioPciDeviceAttachment {
+  string bdf = 1;
+  optional string id = 2;
+}
+
+message VsockDeviceAttachment {
+  uint32 cid = 1;
+}

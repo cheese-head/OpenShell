@@ -1561,11 +1561,11 @@ mod tests {
     }
 
     #[test]
-    fn qemu_disk_args_support_dpu_provisioned_rootfs() {
+    fn qemu_disk_args_support_provider_provisioned_rootfs() {
         let rootfs = VmRootfsConfig {
-            root: VmStorageAttachment::DpuProvisioned {
-                id: "bf-rootfs-1".to_string(),
-                device: PathBuf::from("/dev/disk/by-id/dpu-rootfs"),
+            root: VmStorageAttachment::ProviderProvisioned {
+                id: "provider-rootfs-1".to_string(),
+                device: PathBuf::from("/dev/disk/by-id/provider-rootfs"),
                 read_only: true,
             },
             overlay: VmStorageAttachment::host_file(PathBuf::from("/overlay.ext4"), false),
@@ -1574,9 +1574,12 @@ mod tests {
 
         let args = qemu_disk_args(&rootfs);
 
-        assert!(args.contains(
-            &"file=/dev/disk/by-id/dpu-rootfs,if=none,format=raw,id=rootfs,readonly=on".to_string()
-        ));
+        assert!(
+            args.contains(
+                &"file=/dev/disk/by-id/provider-rootfs,if=none,format=raw,id=rootfs,readonly=on"
+                    .to_string()
+            )
+        );
         assert!(args.contains(&"virtio-blk-pci,drive=rootfs".to_string()));
     }
 

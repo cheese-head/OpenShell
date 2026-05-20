@@ -150,6 +150,12 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
 | `guest_tls_cert` | unset | Guest client certificate. |
 | `guest_tls_key` | unset | Guest client private key. |
+| `attachment_provider_endpoint` | unset | gRPC endpoint for a VM attachment provider service. Mutually exclusive with `attachment_provider_config`. |
+| `attachment_provider_config` | unset | Static VM attachment provider JSON config for local OpenShell-side validation. Mutually exclusive with `attachment_provider_endpoint`. |
+| `attachment_provider_tls_ca` | unset | CA certificate for the attachment provider mTLS client bundle. Required when `attachment_provider_endpoint` uses `https://`. |
+| `attachment_provider_tls_cert` | unset | Client certificate for the attachment provider mTLS client bundle. Required when `attachment_provider_endpoint` uses `https://`. |
+| `attachment_provider_tls_key` | unset | Client private key for the attachment provider mTLS client bundle. Required when `attachment_provider_endpoint` uses `https://`. |
+| `attachment_provider_tls_server_name` | unset | Optional TLS server name override for the attachment provider endpoint. |
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
@@ -195,9 +201,82 @@ GPU requirements.
 
 QEMU launch plans can represent TAP networking, VFIO PCI network functions,
 vDPA devices, generic VFIO PCI devices, vhost-vsock devices, and host- or
-DPU-provisioned rootfs storage. The default VM driver still constructs the same
-host-file rootfs plus TAP/vsock plan as before; hardware-specific extensions can
-replace those typed attachments without relying on raw QEMU argument injection.
+provider-provisioned rootfs storage. The default VM driver still constructs the
+same host-file rootfs plus TAP/vsock plan as before; hardware-specific
+extensions can replace those typed attachments without relying on raw QEMU
+argument injection.
+
+The crate also includes a generic VM attachment provider lifecycle extension.
+The public API is a `VmAttachmentProvider` trait: the extension asks the
+provider for a per-sandbox attachment lease during `before_vm_launch`, applies
+the returned typed rootfs, network, device, and environment changes to the
+`VmLaunchPlan`, persists the lease in extension state, and detaches it on
+launch failure or sandbox delete.
+The gRPC implementation uses `openshell.vm_attachment.v1.VmAttachmentProvider` from
+[`proto/vm_attachment_provider.proto`](../../proto/vm_attachment_provider.proto).
+A single provider service can manage many sandbox leases and own external
+resources such as BlueField representors, VF/vDPA devices, provider-exposed
+rootfs devices, and switch rules before QEMU starts.
+
+Configure the gateway to use a VM attachment provider endpoint:
+
+```toml
+[openshell.drivers.vm]
+grpc_endpoint = "http://host.containers.internal:18081"
+attachment_provider_endpoint = "https://bluefield.example.com:50071"
+attachment_provider_tls_ca = "/etc/openshell/attachment-provider/ca.crt"
+attachment_provider_tls_cert = "/etc/openshell/attachment-provider/client.crt"
+attachment_provider_tls_key = "/etc/openshell/attachment-provider/client.key"
+```
+
+For local OpenShell-side validation, the default binary can install the static
+VM attachment lifecycle extension from a JSON file instead:
+
+```shell
+openshell-driver-vm \
+  --vm-attachment-provider-config /etc/openshell/vm-attachment-provider.json \
+  ...
+```
+
+The gateway equivalent is:
+
+```toml
+[openshell.drivers.vm]
+attachment_provider_config = "/etc/openshell/vm-attachment-provider.json"
+```
+
+Example static config that replaces TAP with vDPA and uses a provider-provisioned
+rootfs device:
+
+```json
+{
+  "attachment_id_prefix": "bf",
+  "replace_network": true,
+  "network": [
+    {
+      "kind": "vdpa",
+      "device": "/dev/vhost-vdpa-0",
+      "mac": "02:00:00:00:00:02"
+    }
+  ],
+  "rootfs": {
+    "root": {
+      "kind": "provider_provisioned",
+      "id": "rootfs-worker2",
+      "device": "/dev/disk/by-id/nvme-rootfs-worker2",
+      "read_only": true
+    },
+    "overlay": {
+      "kind": "host_file",
+      "path": "/var/lib/openshell/overlays/sandbox.ext4",
+      "read_only": false
+    }
+  },
+  "env": [
+    "OPENSHELL_VM_ATTACHMENT_PROVIDER=bluefield"
+  ]
+}
+```
 
 Available hooks:
 

@@ -17,7 +17,7 @@ pub enum VmStorageAttachment {
         #[serde(default)]
         read_only: bool,
     },
-    DpuProvisioned {
+    ProviderProvisioned {
         id: String,
         device: PathBuf,
         #[serde(default)]
@@ -33,7 +33,7 @@ impl VmStorageAttachment {
     pub fn path(&self) -> &Path {
         match self {
             Self::HostFile { path, .. } | Self::HostBlockDevice { path, .. } => path,
-            Self::DpuProvisioned { device, .. } => device,
+            Self::ProviderProvisioned { device, .. } => device,
         }
     }
 
@@ -41,7 +41,7 @@ impl VmStorageAttachment {
         match self {
             Self::HostFile { read_only, .. }
             | Self::HostBlockDevice { read_only, .. }
-            | Self::DpuProvisioned { read_only, .. } => *read_only,
+            | Self::ProviderProvisioned { read_only, .. } => *read_only,
         }
     }
 

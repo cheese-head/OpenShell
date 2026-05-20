@@ -42,12 +42,22 @@ impl Default for PersistedExtensionState {
 pub struct VmLifecycleHookResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persisted_state: Option<PersistedExtensionState>,
+    #[serde(default)]
+    pub clear_persisted_state: bool,
 }
 
 impl VmLifecycleHookResult {
     pub fn with_state(state: PersistedExtensionState) -> Self {
         Self {
             persisted_state: Some(state),
+            clear_persisted_state: false,
+        }
+    }
+
+    pub fn clear_state() -> Self {
+        Self {
+            persisted_state: None,
+            clear_persisted_state: true,
         }
     }
 }
@@ -506,6 +516,17 @@ async fn persist_lifecycle_hook_result(
     result: VmLifecycleHookResult,
     states: &mut ExtensionStateMap,
 ) -> VmLifecycleResult<()> {
+    if result.clear_persisted_state {
+        if result.persisted_state.is_some() {
+            return Err(VmLifecycleError::new(format!(
+                "VM lifecycle extension '{extension_name}' cannot persist and clear state in the same hook result"
+            )));
+        }
+        delete_persisted_extension_state(state_dir, extension_name).await?;
+        states.remove(extension_name);
+        return Ok(());
+    }
+
     let Some(state) = result.persisted_state else {
         return Ok(());
     };
@@ -547,6 +568,25 @@ async fn write_persisted_extension_state(
             path.display()
         ))
     })
+}
+
+async fn delete_persisted_extension_state(
+    state_dir: &Path,
+    extension_name: &str,
+) -> VmLifecycleResult<()> {
+    let path = extension_state_path(state_dir, extension_name).map_err(|err| {
+        VmLifecycleError::new(format!(
+            "invalid VM lifecycle extension state path for '{extension_name}': {err}"
+        ))
+    })?;
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(VmLifecycleError::new(format!(
+            "remove VM lifecycle extension state {} failed: {err}",
+            path.display()
+        ))),
+    }
 }
 
 async fn create_private_dir_all(path: &Path) -> Result<(), std::io::Error> {
@@ -649,12 +689,14 @@ fn validate_storage_attachment(name: &str, storage: &VmStorageAttachment) -> Res
                 return Err(format!("VM launch {name} storage path is empty"));
             }
         }
-        VmStorageAttachment::DpuProvisioned { id, device, .. } => {
+        VmStorageAttachment::ProviderProvisioned { id, device, .. } => {
             if id.trim().is_empty() {
-                return Err(format!("VM launch {name} DPU storage id is empty"));
+                return Err(format!("VM launch {name} provider storage id is empty"));
             }
             if device.as_os_str().is_empty() {
-                return Err(format!("VM launch {name} DPU storage device path is empty"));
+                return Err(format!(
+                    "VM launch {name} provider storage device path is empty"
+                ));
             }
         }
     }

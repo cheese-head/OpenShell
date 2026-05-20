@@ -99,6 +99,24 @@ pub struct VmComputeConfig {
 
     /// Host-side private key for the guest's mTLS client bundle.
     pub guest_tls_key: Option<PathBuf>,
+
+    /// gRPC endpoint for a VM attachment provider service.
+    pub attachment_provider_endpoint: Option<String>,
+
+    /// Static VM attachment provider JSON config used for local OpenShell-side testing.
+    pub attachment_provider_config: Option<PathBuf>,
+
+    /// CA certificate for the VM attachment provider mTLS client bundle.
+    pub attachment_provider_tls_ca: Option<PathBuf>,
+
+    /// Client certificate for the VM attachment provider mTLS client bundle.
+    pub attachment_provider_tls_cert: Option<PathBuf>,
+
+    /// Client private key for the VM attachment provider mTLS client bundle.
+    pub attachment_provider_tls_key: Option<PathBuf>,
+
+    /// Optional TLS server name override for the VM attachment provider.
+    pub attachment_provider_tls_server_name: Option<String>,
 }
 
 impl VmComputeConfig {
@@ -163,6 +181,12 @@ impl Default for VmComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            attachment_provider_endpoint: None,
+            attachment_provider_config: None,
+            attachment_provider_tls_ca: None,
+            attachment_provider_tls_cert: None,
+            attachment_provider_tls_key: None,
+            attachment_provider_tls_server_name: None,
         }
     }
 }
@@ -457,6 +481,7 @@ pub async fn spawn(
             "grpc_endpoint is required when using the vm compute driver",
         ));
     }
+    validate_attachment_provider_config(vm_config)?;
 
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
     let socket_path = compute_driver_socket_path(vm_config);
@@ -498,6 +523,28 @@ pub async fn spawn(
         command.arg("--guest-tls-cert").arg(tls.cert);
         command.arg("--guest-tls-key").arg(tls.key);
     }
+    if let Some(endpoint) = &vm_config.attachment_provider_endpoint {
+        command
+            .arg("--vm-attachment-provider-endpoint")
+            .arg(endpoint);
+    }
+    if let Some(config) = &vm_config.attachment_provider_config {
+        command.arg("--vm-attachment-provider-config").arg(config);
+    }
+    if let Some(ca) = &vm_config.attachment_provider_tls_ca {
+        command.arg("--vm-attachment-provider-tls-ca").arg(ca);
+    }
+    if let Some(cert) = &vm_config.attachment_provider_tls_cert {
+        command.arg("--vm-attachment-provider-tls-cert").arg(cert);
+    }
+    if let Some(key) = &vm_config.attachment_provider_tls_key {
+        command.arg("--vm-attachment-provider-tls-key").arg(key);
+    }
+    if let Some(server_name) = &vm_config.attachment_provider_tls_server_name {
+        command
+            .arg("--vm-attachment-provider-tls-server-name")
+            .arg(server_name);
+    }
 
     let mut child = command.spawn().map_err(|e| {
         Error::execution(format!(
@@ -508,6 +555,64 @@ pub async fn spawn(
     let channel = wait_for_compute_driver(&socket_path, &mut child).await?;
     let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
     Ok((channel, process))
+}
+
+pub fn validate_attachment_provider_config(vm_config: &VmComputeConfig) -> Result<()> {
+    if vm_config.attachment_provider_endpoint.is_some()
+        && vm_config.attachment_provider_config.is_some()
+    {
+        return Err(Error::config(
+            "configure either attachment_provider_endpoint or attachment_provider_config for the vm compute driver, not both",
+        ));
+    }
+
+    let tls_configured = vm_config.attachment_provider_tls_ca.is_some()
+        || vm_config.attachment_provider_tls_cert.is_some()
+        || vm_config.attachment_provider_tls_key.is_some()
+        || vm_config.attachment_provider_tls_server_name.is_some();
+    if tls_configured && vm_config.attachment_provider_endpoint.is_none() {
+        return Err(Error::config(
+            "attachment_provider_endpoint is required when VM attachment provider TLS is configured",
+        ));
+    }
+
+    let endpoint_requires_tls = vm_config
+        .attachment_provider_endpoint
+        .as_deref()
+        .is_some_and(|endpoint| endpoint.starts_with("https://"));
+    if tls_configured && !endpoint_requires_tls {
+        return Err(Error::config(
+            "attachment_provider_endpoint must use https:// when VM attachment provider TLS is configured",
+        ));
+    }
+    if !tls_configured && !endpoint_requires_tls {
+        return Ok(());
+    }
+
+    let Some(ca) = &vm_config.attachment_provider_tls_ca else {
+        return Err(Error::config(
+            "attachment_provider_tls_ca is required when VM attachment provider TLS is configured",
+        ));
+    };
+    let Some(cert) = &vm_config.attachment_provider_tls_cert else {
+        return Err(Error::config(
+            "attachment_provider_tls_cert is required when VM attachment provider TLS is configured",
+        ));
+    };
+    let Some(key) = &vm_config.attachment_provider_tls_key else {
+        return Err(Error::config(
+            "attachment_provider_tls_key is required when VM attachment provider TLS is configured",
+        ));
+    };
+    for path in [ca, cert, key] {
+        if !path.is_file() {
+            return Err(Error::config(format!(
+                "vm attachment provider TLS material '{}' does not exist or is not a file",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -583,7 +688,7 @@ mod tests {
     use super::{
         VmComputeConfig, compute_driver_guest_tls_paths, compute_driver_socket_path, current_euid,
         prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
-        resolve_driver_search_dirs,
+        resolve_driver_search_dirs, validate_attachment_provider_config,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
@@ -680,6 +785,97 @@ mod tests {
         assert_eq!(guest_paths.key, guest_key);
         assert_ne!(guest_paths.cert, server_cert);
         assert_ne!(guest_paths.key, server_key);
+    }
+
+    #[test]
+    fn attachment_provider_config_rejects_endpoint_and_static_config() {
+        let vm_config = VmComputeConfig {
+            attachment_provider_endpoint: Some("http://127.0.0.1:50071".to_string()),
+            attachment_provider_config: Some(PathBuf::from("/tmp/static-provider.json")),
+            ..Default::default()
+        };
+
+        let err = validate_attachment_provider_config(&vm_config)
+            .expect_err("endpoint and static config should be mutually exclusive")
+            .to_string();
+        assert!(err.contains("attachment_provider_endpoint"));
+        assert!(err.contains("attachment_provider_config"));
+    }
+
+    #[test]
+    fn attachment_provider_tls_requires_endpoint() {
+        let vm_config = VmComputeConfig {
+            attachment_provider_tls_ca: Some(PathBuf::from("/tmp/ca.crt")),
+            attachment_provider_tls_cert: Some(PathBuf::from("/tmp/client.crt")),
+            attachment_provider_tls_key: Some(PathBuf::from("/tmp/client.key")),
+            ..Default::default()
+        };
+
+        let err = validate_attachment_provider_config(&vm_config)
+            .expect_err("TLS material should require an endpoint")
+            .to_string();
+        assert!(err.contains("attachment_provider_endpoint is required"));
+    }
+
+    #[test]
+    fn attachment_provider_https_requires_complete_tls_bundle() {
+        let dir = tempdir().unwrap();
+        let ca = dir.path().join("ca.crt");
+        std::fs::write(&ca, "ca").unwrap();
+        let vm_config = VmComputeConfig {
+            attachment_provider_endpoint: Some("https://provider.internal:50071".to_string()),
+            attachment_provider_tls_ca: Some(ca),
+            ..Default::default()
+        };
+
+        let err = validate_attachment_provider_config(&vm_config)
+            .expect_err("https endpoint should require complete TLS bundle")
+            .to_string();
+        assert!(err.contains("attachment_provider_tls_cert"));
+    }
+
+    #[test]
+    fn attachment_provider_tls_rejects_plaintext_endpoint() {
+        let dir = tempdir().unwrap();
+        let ca = dir.path().join("ca.crt");
+        let cert = dir.path().join("client.crt");
+        let key = dir.path().join("client.key");
+        for path in [&ca, &cert, &key] {
+            std::fs::write(path, path.display().to_string()).unwrap();
+        }
+        let vm_config = VmComputeConfig {
+            attachment_provider_endpoint: Some("http://provider.internal:50071".to_string()),
+            attachment_provider_tls_ca: Some(ca),
+            attachment_provider_tls_cert: Some(cert),
+            attachment_provider_tls_key: Some(key),
+            ..Default::default()
+        };
+
+        let err = validate_attachment_provider_config(&vm_config)
+            .expect_err("TLS material should require an https endpoint")
+            .to_string();
+        assert!(err.contains("must use https://"));
+    }
+
+    #[test]
+    fn attachment_provider_tls_accepts_complete_bundle() {
+        let dir = tempdir().unwrap();
+        let ca = dir.path().join("ca.crt");
+        let cert = dir.path().join("client.crt");
+        let key = dir.path().join("client.key");
+        for path in [&ca, &cert, &key] {
+            std::fs::write(path, path.display().to_string()).unwrap();
+        }
+        let vm_config = VmComputeConfig {
+            attachment_provider_endpoint: Some("https://provider.internal:50071".to_string()),
+            attachment_provider_tls_ca: Some(ca),
+            attachment_provider_tls_cert: Some(cert),
+            attachment_provider_tls_key: Some(key),
+            attachment_provider_tls_server_name: Some("provider.internal".to_string()),
+            ..Default::default()
+        };
+
+        validate_attachment_provider_config(&vm_config).unwrap();
     }
 
     #[test]

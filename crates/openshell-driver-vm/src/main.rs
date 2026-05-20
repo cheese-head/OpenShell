@@ -6,17 +6,21 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_driver_vm::{
+    GrpcVmAttachmentProvider, GrpcVmAttachmentProviderConfig, StaticVmAttachmentProvider,
+    StaticVmAttachmentProviderConfig, VmAttachmentLifecycleExtension,
+    VmAttachmentProviderClientTlsConfig, VmBackend, VmDeviceAttachment, VmDriver, VmDriverConfig,
+    VmLaunchConfig, VmLifecycleExtension, VmLifecycleExtensions, VmNetworkAttachment,
+    VmRootfsConfig, procguard, run_vm,
+};
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
-use openshell_driver_vm::{
-    VmBackend, VmDeviceAttachment, VmDriver, VmDriverConfig, VmLaunchConfig, VmLifecycleExtensions,
-    VmNetworkAttachment, VmRootfsConfig, procguard, run_vm,
-};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::info;
@@ -164,6 +168,42 @@ struct Args {
 
     #[arg(long = "vm-device-attachment", hide = true)]
     vm_device_attachment: Vec<String>,
+
+    #[arg(
+        long = "vm-attachment-provider-config",
+        env = "OPENSHELL_VM_ATTACHMENT_PROVIDER_CONFIG"
+    )]
+    vm_attachment_provider_config: Option<PathBuf>,
+
+    #[arg(
+        long = "vm-attachment-provider-endpoint",
+        env = "OPENSHELL_VM_ATTACHMENT_PROVIDER_ENDPOINT"
+    )]
+    vm_attachment_provider_endpoint: Option<String>,
+
+    #[arg(
+        long = "vm-attachment-provider-tls-ca",
+        env = "OPENSHELL_VM_ATTACHMENT_PROVIDER_TLS_CA"
+    )]
+    vm_attachment_provider_tls_ca: Option<PathBuf>,
+
+    #[arg(
+        long = "vm-attachment-provider-tls-cert",
+        env = "OPENSHELL_VM_ATTACHMENT_PROVIDER_TLS_CERT"
+    )]
+    vm_attachment_provider_tls_cert: Option<PathBuf>,
+
+    #[arg(
+        long = "vm-attachment-provider-tls-key",
+        env = "OPENSHELL_VM_ATTACHMENT_PROVIDER_TLS_KEY"
+    )]
+    vm_attachment_provider_tls_key: Option<PathBuf>,
+
+    #[arg(
+        long = "vm-attachment-provider-tls-server-name",
+        env = "OPENSHELL_VM_ATTACHMENT_PROVIDER_TLS_SERVER_NAME"
+    )]
+    vm_attachment_provider_tls_server_name: Option<String>,
 }
 
 #[tokio::main]
@@ -191,6 +231,8 @@ async fn main() -> Result<()> {
         .init();
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
+    let lifecycle_extensions =
+        vm_lifecycle_extensions(&args).map_err(|err| miette::miette!("{err}"))?;
 
     // Arm procguard so that if the gateway is killed (SIGKILL or crash)
     // we also die. Without this the driver is reparented to init and
@@ -223,7 +265,7 @@ async fn main() -> Result<()> {
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
-        lifecycle_extensions: VmLifecycleExtensions::default(),
+        lifecycle_extensions,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -292,6 +334,109 @@ fn compute_driver_listen_mode(args: &Args) -> std::result::Result<ComputeDriverL
     };
 
     Ok(ComputeDriverListenMode::Tcp(bind_address))
+}
+
+fn vm_lifecycle_extensions(args: &Args) -> std::result::Result<VmLifecycleExtensions, String> {
+    let mut extensions: Vec<Arc<dyn VmLifecycleExtension>> = Vec::new();
+
+    match (
+        args.vm_attachment_provider_endpoint.as_deref(),
+        args.vm_attachment_provider_config.as_ref(),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "configure either --vm-attachment-provider-endpoint or --vm-attachment-provider-config, not both"
+                    .to_string(),
+            );
+        }
+        (Some(endpoint), None) => {
+            let provider = Arc::new(
+                GrpcVmAttachmentProvider::connect_lazy_with_config(vm_attachment_provider_config(
+                    args, endpoint,
+                )?)
+                .map_err(|err| err.message().to_string())?,
+            );
+            extensions.push(Arc::new(VmAttachmentLifecycleExtension::new(provider)));
+        }
+        (None, None)
+            if args.vm_attachment_provider_tls_ca.is_some()
+                || args.vm_attachment_provider_tls_cert.is_some()
+                || args.vm_attachment_provider_tls_key.is_some()
+                || args.vm_attachment_provider_tls_server_name.is_some() =>
+        {
+            return Err(
+                "--vm-attachment-provider-endpoint is required with VM attachment provider TLS options"
+                    .to_string(),
+            );
+        }
+        (None, Some(config_path)) => {
+            let config_bytes = std::fs::read(config_path)
+                .map_err(|err| format!("read {}: {err}", config_path.display()))?;
+            let config: StaticVmAttachmentProviderConfig = serde_json::from_slice(&config_bytes)
+                .map_err(|err| {
+                    format!(
+                        "decode VM attachment lifecycle config {}: {err}",
+                        config_path.display()
+                    )
+                })?;
+            let provider = Arc::new(StaticVmAttachmentProvider::new(config));
+            extensions.push(Arc::new(VmAttachmentLifecycleExtension::new(provider)));
+        }
+        (None, None) => {}
+    }
+
+    VmLifecycleExtensions::new(extensions)
+        .map_err(|err| format!("configure VM lifecycle extensions: {err}"))
+}
+
+fn vm_attachment_provider_config(
+    args: &Args,
+    endpoint: &str,
+) -> std::result::Result<GrpcVmAttachmentProviderConfig, String> {
+    Ok(GrpcVmAttachmentProviderConfig {
+        endpoint: endpoint.to_string(),
+        tls: vm_attachment_provider_tls_config(args, endpoint)?,
+    })
+}
+
+fn vm_attachment_provider_tls_config(
+    args: &Args,
+    endpoint: &str,
+) -> std::result::Result<Option<VmAttachmentProviderClientTlsConfig>, String> {
+    let requires_tls = endpoint.starts_with("https://")
+        || args.vm_attachment_provider_tls_ca.is_some()
+        || args.vm_attachment_provider_tls_cert.is_some()
+        || args.vm_attachment_provider_tls_key.is_some()
+        || args.vm_attachment_provider_tls_server_name.is_some();
+    if !requires_tls {
+        return Ok(None);
+    }
+    if !endpoint.starts_with("https://") {
+        return Err(
+            "--vm-attachment-provider-endpoint must use https:// when VM attachment provider TLS is configured"
+                .to_string(),
+        );
+    }
+
+    let ca_cert = args.vm_attachment_provider_tls_ca.clone().ok_or_else(|| {
+        "--vm-attachment-provider-tls-ca is required for VM attachment provider TLS".to_string()
+    })?;
+    let client_cert = args
+        .vm_attachment_provider_tls_cert
+        .clone()
+        .ok_or_else(|| {
+            "--vm-attachment-provider-tls-cert is required for VM attachment provider TLS"
+                .to_string()
+        })?;
+    let client_key = args.vm_attachment_provider_tls_key.clone().ok_or_else(|| {
+        "--vm-attachment-provider-tls-key is required for VM attachment provider TLS".to_string()
+    })?;
+    Ok(Some(VmAttachmentProviderClientTlsConfig {
+        ca_cert,
+        client_cert,
+        client_key,
+        domain_name: args.vm_attachment_provider_tls_server_name.clone(),
+    }))
 }
 
 fn prepare_compute_driver_socket(socket_path: &Path) -> std::result::Result<(), String> {
@@ -622,7 +767,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 mod tests {
     use super::{
         Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode,
+        compute_driver_listen_mode, vm_lifecycle_extensions,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -777,5 +922,36 @@ mod tests {
                 expected_peer_pid: None,
             }
         );
+    }
+
+    #[test]
+    fn attachment_provider_config_rejects_endpoint_and_static_config() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--vm-attachment-provider-endpoint",
+            "http://127.0.0.1:50071",
+            "--vm-attachment-provider-config",
+            "/tmp/static-attachment-provider.json",
+        ]);
+
+        let err = vm_lifecycle_extensions(&args)
+            .expect_err("endpoint and static config should be mutually exclusive");
+        assert!(err.contains("--vm-attachment-provider-endpoint"));
+        assert!(err.contains("--vm-attachment-provider-config"));
+    }
+
+    #[test]
+    fn attachment_provider_config_rejects_incomplete_tls_bundle() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--vm-attachment-provider-endpoint",
+            "https://provider.internal:50071",
+            "--vm-attachment-provider-tls-ca",
+            "/tmp/ca.crt",
+        ]);
+
+        let err = vm_lifecycle_extensions(&args)
+            .expect_err("https attachment providers should require complete client TLS material");
+        assert!(err.contains("--vm-attachment-provider-tls-cert"));
     }
 }
