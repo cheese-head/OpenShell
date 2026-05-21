@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-bluefield"
+description = "BlueField attachment provider primitives for OpenShell VM sandboxes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+clap = { workspace = true }
+miette = { workspace = true }
+prost = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tonic = { workspace = true, features = ["transport", "tls"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-stream = { workspace = true, features = ["net"] }
+
+[lints]
+workspace = true

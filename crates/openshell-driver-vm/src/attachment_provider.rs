@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::attachments::{
-    VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig, VmStorageAttachment,
-};
+use crate::attachments::{DeviceAttachment, NetworkAttachment, RootfsConfig, StorageAttachment};
 use crate::extension::{
     LaunchAbortReason, PersistedExtensionState, ReconcileOutcome, VmLaunchPlan, VmLifecycleContext,
     VmLifecycleError, VmLifecycleExtension, VmLifecycleHookResult, VmLifecycleResult,
     validate_extension_name,
 };
 use crate::runtime::VmBackend;
-use openshell_core::proto::vm_attachment::v1 as attachment_proto;
+use openshell_core::proto::attachment::v1 as attachment_proto;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,101 +18,101 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 pub const VM_ATTACHMENT_LIFECYCLE_EXTENSION_NAME: &str = "vm-attachments";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VmAttachmentProviderHealth {
+pub struct AttachmentProviderHealth {
     pub healthy: bool,
     pub message: String,
     pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VmAttachmentPlan {
+pub struct AttachmentPlan {
     #[serde(default)]
     pub replace_network: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub network: Vec<VmNetworkAttachment>,
+    pub network: Vec<NetworkAttachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub devices: Vec<VmDeviceAttachment>,
+    pub devices: Vec<DeviceAttachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rootfs: Option<VmRootfsConfig>,
+    pub rootfs: Option<RootfsConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmAttachmentRequest {
+pub struct AttachmentRequest {
     pub sandbox_id: String,
     pub sandbox_name: String,
     pub image_ref: Option<String>,
     pub state_dir: PathBuf,
     pub backend: VmBackend,
-    pub rootfs: VmRootfsConfig,
-    pub network: Vec<VmNetworkAttachment>,
-    pub devices: Vec<VmDeviceAttachment>,
+    pub rootfs: RootfsConfig,
+    pub network: Vec<NetworkAttachment>,
+    pub devices: Vec<DeviceAttachment>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VmAttachmentLease {
+pub struct AttachmentLease {
     pub attachment_id: String,
     #[serde(default)]
     pub generation: u64,
     #[serde(default)]
-    pub plan: VmAttachmentPlan,
+    pub plan: AttachmentPlan,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
 }
 
 #[tonic::async_trait]
-pub trait VmAttachmentProvider: std::fmt::Debug + Send + Sync {
-    async fn health(&self) -> VmLifecycleResult<VmAttachmentProviderHealth>;
+pub trait AttachmentProvider: std::fmt::Debug + Send + Sync {
+    async fn health(&self) -> VmLifecycleResult<AttachmentProviderHealth>;
 
-    async fn attach(&self, request: VmAttachmentRequest) -> VmLifecycleResult<VmAttachmentLease>;
+    async fn attach(&self, request: AttachmentRequest) -> VmLifecycleResult<AttachmentLease>;
 
-    async fn detach(&self, lease: VmAttachmentLease) -> VmLifecycleResult<()>;
+    async fn detach(&self, lease: AttachmentLease) -> VmLifecycleResult<()>;
 
-    async fn list(&self) -> VmLifecycleResult<Vec<VmAttachmentLease>>;
+    async fn list(&self) -> VmLifecycleResult<Vec<AttachmentLease>>;
 
-    async fn reconcile(&self, lease: VmAttachmentLease) -> VmLifecycleResult<ReconcileOutcome>;
+    async fn reconcile(&self, lease: AttachmentLease) -> VmLifecycleResult<ReconcileOutcome>;
 }
 
 #[derive(Debug, Clone)]
-pub struct GrpcVmAttachmentProvider {
-    client: attachment_proto::vm_attachment_provider_client::VmAttachmentProviderClient<Channel>,
+pub struct GrpcAttachmentProvider {
+    client: attachment_proto::attachment_provider_client::AttachmentProviderClient<Channel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrpcVmAttachmentProviderConfig {
+pub struct GrpcAttachmentProviderConfig {
     pub endpoint: String,
-    pub tls: Option<VmAttachmentProviderClientTlsConfig>,
+    pub tls: Option<AttachmentProviderClientTlsConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmAttachmentProviderClientTlsConfig {
+pub struct AttachmentProviderClientTlsConfig {
     pub ca_cert: PathBuf,
     pub client_cert: PathBuf,
     pub client_key: PathBuf,
     pub domain_name: Option<String>,
 }
 
-impl GrpcVmAttachmentProvider {
+impl GrpcAttachmentProvider {
     pub fn connect_lazy(endpoint: impl Into<String>) -> VmLifecycleResult<Self> {
-        Self::connect_lazy_with_config(GrpcVmAttachmentProviderConfig {
+        Self::connect_lazy_with_config(GrpcAttachmentProviderConfig {
             endpoint: endpoint.into(),
             tls: None,
         })
     }
 
     pub fn connect_lazy_with_config(
-        config: GrpcVmAttachmentProviderConfig,
+        config: GrpcAttachmentProviderConfig,
     ) -> VmLifecycleResult<Self> {
         let endpoint = Endpoint::from_shared(config.endpoint.clone()).map_err(|err| {
-            VmLifecycleError::new(format!("invalid VM attachment provider endpoint: {err}"))
+            VmLifecycleError::new(format!("invalid attachment provider endpoint: {err}"))
         })?;
         let endpoint = if let Some(tls) = config.tls {
             endpoint
                 .tls_config(client_tls_config(tls)?)
                 .map_err(|err| {
                     VmLifecycleError::new(format!(
-                        "configure VM attachment provider TLS for '{}': {err}",
+                        "configure attachment provider TLS for '{}': {err}",
                         config.endpoint
                     ))
                 })?
@@ -126,31 +124,30 @@ impl GrpcVmAttachmentProvider {
 
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            client:
-                attachment_proto::vm_attachment_provider_client::VmAttachmentProviderClient::new(
-                    channel,
-                ),
+            client: attachment_proto::attachment_provider_client::AttachmentProviderClient::new(
+                channel,
+            ),
         }
     }
 }
 
 #[tonic::async_trait]
-impl VmAttachmentProvider for GrpcVmAttachmentProvider {
-    async fn health(&self) -> VmLifecycleResult<VmAttachmentProviderHealth> {
+impl AttachmentProvider for GrpcAttachmentProvider {
+    async fn health(&self) -> VmLifecycleResult<AttachmentProviderHealth> {
         let mut client = self.client.clone();
         let response = client
             .health(attachment_proto::HealthRequest {})
             .await
             .map_err(|err| grpc_error("health", err))?
             .into_inner();
-        Ok(VmAttachmentProviderHealth {
+        Ok(AttachmentProviderHealth {
             healthy: response.healthy,
             message: response.message,
             capabilities: response.capabilities,
         })
     }
 
-    async fn attach(&self, request: VmAttachmentRequest) -> VmLifecycleResult<VmAttachmentLease> {
+    async fn attach(&self, request: AttachmentRequest) -> VmLifecycleResult<AttachmentLease> {
         let mut client = self.client.clone();
         let response = client
             .attach(attachment_proto::AttachRequest::from(request))
@@ -160,23 +157,23 @@ impl VmAttachmentProvider for GrpcVmAttachmentProvider {
         response
             .lease
             .ok_or_else(|| {
-                VmLifecycleError::new("VM attachment provider attach response missing lease")
+                VmLifecycleError::new("attachment provider attach response missing lease")
             })?
             .try_into()
     }
 
-    async fn detach(&self, lease: VmAttachmentLease) -> VmLifecycleResult<()> {
+    async fn detach(&self, lease: AttachmentLease) -> VmLifecycleResult<()> {
         let mut client = self.client.clone();
         client
             .detach(attachment_proto::DetachRequest {
-                lease: Some(attachment_proto::VmAttachmentLease::from(lease)),
+                lease: Some(attachment_proto::AttachmentLease::from(lease)),
             })
             .await
             .map_err(|err| grpc_error("detach", err))?;
         Ok(())
     }
 
-    async fn list(&self) -> VmLifecycleResult<Vec<VmAttachmentLease>> {
+    async fn list(&self) -> VmLifecycleResult<Vec<AttachmentLease>> {
         let mut client = self.client.clone();
         let response = client
             .list(attachment_proto::ListRequest {})
@@ -186,11 +183,11 @@ impl VmAttachmentProvider for GrpcVmAttachmentProvider {
         response.leases.into_iter().map(TryInto::try_into).collect()
     }
 
-    async fn reconcile(&self, lease: VmAttachmentLease) -> VmLifecycleResult<ReconcileOutcome> {
+    async fn reconcile(&self, lease: AttachmentLease) -> VmLifecycleResult<ReconcileOutcome> {
         let mut client = self.client.clone();
         let response = client
             .reconcile(attachment_proto::ReconcileRequest {
-                lease: Some(attachment_proto::VmAttachmentLease::from(lease)),
+                lease: Some(attachment_proto::AttachmentLease::from(lease)),
             })
             .await
             .map_err(|err| grpc_error("reconcile", err))?
@@ -200,47 +197,47 @@ impl VmAttachmentProvider for GrpcVmAttachmentProvider {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StaticVmAttachmentProviderConfig {
+pub struct StaticAttachmentProviderConfig {
     #[serde(default = "default_static_attachment_id_prefix")]
     pub attachment_id_prefix: String,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
     #[serde(default, flatten)]
-    pub plan: VmAttachmentPlan,
+    pub plan: AttachmentPlan,
 }
 
-impl Default for StaticVmAttachmentProviderConfig {
+impl Default for StaticAttachmentProviderConfig {
     fn default() -> Self {
         Self {
             attachment_id_prefix: default_static_attachment_id_prefix(),
             metadata: BTreeMap::new(),
-            plan: VmAttachmentPlan::default(),
+            plan: AttachmentPlan::default(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticVmAttachmentProvider {
-    config: StaticVmAttachmentProviderConfig,
+pub struct StaticAttachmentProvider {
+    config: StaticAttachmentProviderConfig,
 }
 
-impl StaticVmAttachmentProvider {
-    pub fn new(config: StaticVmAttachmentProviderConfig) -> Self {
+impl StaticAttachmentProvider {
+    pub fn new(config: StaticAttachmentProviderConfig) -> Self {
         Self { config }
     }
 }
 
 #[tonic::async_trait]
-impl VmAttachmentProvider for StaticVmAttachmentProvider {
-    async fn health(&self) -> VmLifecycleResult<VmAttachmentProviderHealth> {
-        Ok(VmAttachmentProviderHealth {
+impl AttachmentProvider for StaticAttachmentProvider {
+    async fn health(&self) -> VmLifecycleResult<AttachmentProviderHealth> {
+        Ok(AttachmentProviderHealth {
             healthy: true,
-            message: "static VM attachment provider configured".to_string(),
+            message: "static attachment provider configured".to_string(),
             capabilities: vec!["static-plan".to_string()],
         })
     }
 
-    async fn attach(&self, request: VmAttachmentRequest) -> VmLifecycleResult<VmAttachmentLease> {
+    async fn attach(&self, request: AttachmentRequest) -> VmLifecycleResult<AttachmentLease> {
         let attachment_id = if self.config.attachment_id_prefix.is_empty() {
             request.sandbox_id
         } else {
@@ -250,7 +247,7 @@ impl VmAttachmentProvider for StaticVmAttachmentProvider {
             )
         };
 
-        Ok(VmAttachmentLease {
+        Ok(AttachmentLease {
             attachment_id,
             generation: 1,
             plan: self.config.plan.clone(),
@@ -258,15 +255,15 @@ impl VmAttachmentProvider for StaticVmAttachmentProvider {
         })
     }
 
-    async fn detach(&self, _lease: VmAttachmentLease) -> VmLifecycleResult<()> {
+    async fn detach(&self, _lease: AttachmentLease) -> VmLifecycleResult<()> {
         Ok(())
     }
 
-    async fn list(&self) -> VmLifecycleResult<Vec<VmAttachmentLease>> {
+    async fn list(&self) -> VmLifecycleResult<Vec<AttachmentLease>> {
         Ok(Vec::new())
     }
 
-    async fn reconcile(&self, _lease: VmAttachmentLease) -> VmLifecycleResult<ReconcileOutcome> {
+    async fn reconcile(&self, _lease: AttachmentLease) -> VmLifecycleResult<ReconcileOutcome> {
         Ok(ReconcileOutcome::Continue)
     }
 }
@@ -274,11 +271,11 @@ impl VmAttachmentProvider for StaticVmAttachmentProvider {
 #[derive(Debug, Clone)]
 pub struct VmAttachmentLifecycleExtension {
     name: String,
-    provider: Arc<dyn VmAttachmentProvider>,
+    provider: Arc<dyn AttachmentProvider>,
 }
 
 impl VmAttachmentLifecycleExtension {
-    pub fn new(provider: Arc<dyn VmAttachmentProvider>) -> Self {
+    pub fn new(provider: Arc<dyn AttachmentProvider>) -> Self {
         Self {
             name: VM_ATTACHMENT_LIFECYCLE_EXTENSION_NAME.to_string(),
             provider,
@@ -287,7 +284,7 @@ impl VmAttachmentLifecycleExtension {
 
     pub fn with_name(
         name: impl Into<String>,
-        provider: Arc<dyn VmAttachmentProvider>,
+        provider: Arc<dyn AttachmentProvider>,
     ) -> VmLifecycleResult<Self> {
         let name = name.into();
         validate_extension_name(&name).map_err(VmLifecycleError::new)?;
@@ -297,7 +294,7 @@ impl VmAttachmentLifecycleExtension {
     fn persisted_lease(
         &self,
         context: &VmLifecycleContext<'_>,
-    ) -> VmLifecycleResult<Option<VmAttachmentLease>> {
+    ) -> VmLifecycleResult<Option<AttachmentLease>> {
         let Some(state) = context.persisted_state(self.name()) else {
             return Ok(None);
         };
@@ -313,7 +310,7 @@ impl VmAttachmentLifecycleExtension {
 
     fn hook_result_with_lease(
         &self,
-        lease: VmAttachmentLease,
+        lease: AttachmentLease,
     ) -> VmLifecycleResult<VmLifecycleHookResult> {
         validate_lease(&lease)?;
         let state = VmAttachmentLifecycleState { lease };
@@ -362,7 +359,7 @@ impl VmLifecycleExtension for VmAttachmentLifecycleExtension {
             return Ok(VmLifecycleHookResult::default());
         }
 
-        let request = VmAttachmentRequest {
+        let request = AttachmentRequest {
             sandbox_id: context.sandbox.id.clone(),
             sandbox_name: context.sandbox.name.clone(),
             image_ref: context.image_ref.map(ToString::to_string),
@@ -406,13 +403,10 @@ impl VmLifecycleExtension for VmAttachmentLifecycleExtension {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VmAttachmentLifecycleState {
-    lease: VmAttachmentLease,
+    lease: AttachmentLease,
 }
 
-fn apply_lease_to_plan(
-    lease: &VmAttachmentLease,
-    plan: &mut VmLaunchPlan,
-) -> VmLifecycleResult<()> {
+fn apply_lease_to_plan(lease: &AttachmentLease, plan: &mut VmLaunchPlan) -> VmLifecycleResult<()> {
     validate_lease(lease)?;
     if lease.plan.replace_network {
         plan.network.clear();
@@ -426,39 +420,37 @@ fn apply_lease_to_plan(
     Ok(())
 }
 
-fn validate_lease(lease: &VmAttachmentLease) -> VmLifecycleResult<()> {
+fn validate_lease(lease: &AttachmentLease) -> VmLifecycleResult<()> {
     if lease.attachment_id.trim().is_empty() {
-        return Err(VmLifecycleError::new(
-            "VM attachment lease id cannot be empty",
-        ));
+        return Err(VmLifecycleError::new("attachment lease id cannot be empty"));
     }
     Ok(())
 }
 
 fn grpc_error(operation: &str, status: tonic::Status) -> VmLifecycleError {
     VmLifecycleError::new(format!(
-        "VM attachment provider {operation} RPC failed: {status}"
+        "attachment provider {operation} RPC failed: {status}"
     ))
 }
 
 fn client_tls_config(
-    config: VmAttachmentProviderClientTlsConfig,
+    config: AttachmentProviderClientTlsConfig,
 ) -> VmLifecycleResult<ClientTlsConfig> {
     let ca_cert = std::fs::read(&config.ca_cert).map_err(|err| {
         VmLifecycleError::new(format!(
-            "read VM attachment provider CA cert {} failed: {err}",
+            "read attachment provider CA cert {} failed: {err}",
             config.ca_cert.display()
         ))
     })?;
     let client_cert = std::fs::read(&config.client_cert).map_err(|err| {
         VmLifecycleError::new(format!(
-            "read VM attachment provider client cert {} failed: {err}",
+            "read attachment provider client cert {} failed: {err}",
             config.client_cert.display()
         ))
     })?;
     let client_key = std::fs::read(&config.client_key).map_err(|err| {
         VmLifecycleError::new(format!(
-            "read VM attachment provider client key {} failed: {err}",
+            "read attachment provider client key {} failed: {err}",
             config.client_key.display()
         ))
     })?;
@@ -475,7 +467,7 @@ fn default_static_attachment_id_prefix() -> String {
     "vm-attachment".to_string()
 }
 
-fn backend_to_proto(backend: &VmBackend) -> String {
+fn consumer_from_backend(backend: &VmBackend) -> String {
     match backend {
         VmBackend::Libkrun => "libkrun",
         VmBackend::Qemu => "qemu",
@@ -483,12 +475,12 @@ fn backend_to_proto(backend: &VmBackend) -> String {
     .to_string()
 }
 
-fn backend_from_proto(backend: &str) -> VmLifecycleResult<VmBackend> {
-    match backend {
+fn backend_from_consumer(consumer: &str) -> VmLifecycleResult<VmBackend> {
+    match consumer {
         "libkrun" | "" => Ok(VmBackend::Libkrun),
         "qemu" => Ok(VmBackend::Qemu),
         other => Err(VmLifecycleError::new(format!(
-            "unsupported VM attachment backend '{other}'"
+            "unsupported attachment consumer '{other}'"
         ))),
     }
 }
@@ -533,21 +525,21 @@ fn reconcile_outcome_to_proto(outcome: ReconcileOutcome) -> (i32, String) {
     }
 }
 
-impl From<VmAttachmentRequest> for attachment_proto::AttachRequest {
-    fn from(value: VmAttachmentRequest) -> Self {
+impl From<AttachmentRequest> for attachment_proto::AttachRequest {
+    fn from(value: AttachmentRequest) -> Self {
         Self {
             sandbox_id: value.sandbox_id,
             sandbox_name: value.sandbox_name,
             image_ref: value.image_ref,
-            backend: backend_to_proto(&value.backend),
-            rootfs: Some(attachment_proto::VmRootfsConfig::from(value.rootfs)),
+            consumer: consumer_from_backend(&value.backend),
+            rootfs: Some(attachment_proto::RootfsConfig::from(value.rootfs)),
             network: value.network.into_iter().map(Into::into).collect(),
             devices: value.devices.into_iter().map(Into::into).collect(),
         }
     }
 }
 
-impl TryFrom<attachment_proto::AttachRequest> for VmAttachmentRequest {
+impl TryFrom<attachment_proto::AttachRequest> for AttachmentRequest {
     type Error = VmLifecycleError;
 
     fn try_from(value: attachment_proto::AttachRequest) -> Result<Self, Self::Error> {
@@ -556,12 +548,10 @@ impl TryFrom<attachment_proto::AttachRequest> for VmAttachmentRequest {
             sandbox_name: value.sandbox_name,
             image_ref: value.image_ref,
             state_dir: PathBuf::new(),
-            backend: backend_from_proto(&value.backend)?,
+            backend: backend_from_consumer(&value.consumer)?,
             rootfs: value
                 .rootfs
-                .ok_or_else(|| {
-                    VmLifecycleError::new("VM attachment attach request missing rootfs")
-                })?
+                .ok_or_else(|| VmLifecycleError::new("attachment attach request missing rootfs"))?
                 .try_into()?,
             network: value
                 .network
@@ -577,21 +567,21 @@ impl TryFrom<attachment_proto::AttachRequest> for VmAttachmentRequest {
     }
 }
 
-impl From<VmAttachmentLease> for attachment_proto::VmAttachmentLease {
-    fn from(value: VmAttachmentLease) -> Self {
+impl From<AttachmentLease> for attachment_proto::AttachmentLease {
+    fn from(value: AttachmentLease) -> Self {
         Self {
             attachment_id: value.attachment_id,
             generation: value.generation,
-            plan: Some(attachment_proto::VmAttachmentPlan::from(value.plan)),
+            plan: Some(attachment_proto::AttachmentPlan::from(value.plan)),
             metadata: value.metadata.into_iter().collect(),
         }
     }
 }
 
-impl TryFrom<attachment_proto::VmAttachmentLease> for VmAttachmentLease {
+impl TryFrom<attachment_proto::AttachmentLease> for AttachmentLease {
     type Error = VmLifecycleError;
 
-    fn try_from(value: attachment_proto::VmAttachmentLease) -> Result<Self, Self::Error> {
+    fn try_from(value: attachment_proto::AttachmentLease) -> Result<Self, Self::Error> {
         let lease = Self {
             attachment_id: value.attachment_id,
             generation: value.generation,
@@ -607,8 +597,8 @@ impl TryFrom<attachment_proto::VmAttachmentLease> for VmAttachmentLease {
     }
 }
 
-impl From<VmAttachmentPlan> for attachment_proto::VmAttachmentPlan {
-    fn from(value: VmAttachmentPlan) -> Self {
+impl From<AttachmentPlan> for attachment_proto::AttachmentPlan {
+    fn from(value: AttachmentPlan) -> Self {
         Self {
             replace_network: value.replace_network,
             network: value.network.into_iter().map(Into::into).collect(),
@@ -619,10 +609,10 @@ impl From<VmAttachmentPlan> for attachment_proto::VmAttachmentPlan {
     }
 }
 
-impl TryFrom<attachment_proto::VmAttachmentPlan> for VmAttachmentPlan {
+impl TryFrom<attachment_proto::AttachmentPlan> for AttachmentPlan {
     type Error = VmLifecycleError;
 
-    fn try_from(value: attachment_proto::VmAttachmentPlan) -> Result<Self, Self::Error> {
+    fn try_from(value: attachment_proto::AttachmentPlan) -> Result<Self, Self::Error> {
         Ok(Self {
             replace_network: value.replace_network,
             network: value
@@ -641,54 +631,52 @@ impl TryFrom<attachment_proto::VmAttachmentPlan> for VmAttachmentPlan {
     }
 }
 
-impl From<VmRootfsConfig> for attachment_proto::VmRootfsConfig {
-    fn from(value: VmRootfsConfig) -> Self {
+impl From<RootfsConfig> for attachment_proto::RootfsConfig {
+    fn from(value: RootfsConfig) -> Self {
         Self {
-            root: Some(attachment_proto::VmStorageAttachment::from(value.root)),
-            overlay: Some(attachment_proto::VmStorageAttachment::from(value.overlay)),
+            root: Some(attachment_proto::StorageAttachment::from(value.root)),
+            overlay: Some(attachment_proto::StorageAttachment::from(value.overlay)),
             image: value.image.map(Into::into),
         }
     }
 }
 
-impl TryFrom<attachment_proto::VmRootfsConfig> for VmRootfsConfig {
+impl TryFrom<attachment_proto::RootfsConfig> for RootfsConfig {
     type Error = VmLifecycleError;
 
-    fn try_from(value: attachment_proto::VmRootfsConfig) -> Result<Self, Self::Error> {
+    fn try_from(value: attachment_proto::RootfsConfig) -> Result<Self, Self::Error> {
         Ok(Self {
             root: value
                 .root
-                .ok_or_else(|| VmLifecycleError::new("VM attachment rootfs config missing root"))?
+                .ok_or_else(|| VmLifecycleError::new("attachment rootfs config missing root"))?
                 .try_into()?,
             overlay: value
                 .overlay
-                .ok_or_else(|| {
-                    VmLifecycleError::new("VM attachment rootfs config missing overlay")
-                })?
+                .ok_or_else(|| VmLifecycleError::new("attachment rootfs config missing overlay"))?
                 .try_into()?,
             image: value.image.map(TryInto::try_into).transpose()?,
         })
     }
 }
 
-impl From<VmStorageAttachment> for attachment_proto::VmStorageAttachment {
-    fn from(value: VmStorageAttachment) -> Self {
-        use attachment_proto::vm_storage_attachment::Kind;
+impl From<StorageAttachment> for attachment_proto::StorageAttachment {
+    fn from(value: StorageAttachment) -> Self {
+        use attachment_proto::storage_attachment::Kind;
 
         let kind = match value {
-            VmStorageAttachment::HostFile { path, read_only } => {
+            StorageAttachment::HostFile { path, read_only } => {
                 Kind::HostFile(attachment_proto::HostFileStorageAttachment {
                     path: path_to_proto(path),
                     read_only,
                 })
             }
-            VmStorageAttachment::HostBlockDevice { path, read_only } => {
+            StorageAttachment::HostBlockDevice { path, read_only } => {
                 Kind::HostBlockDevice(attachment_proto::HostBlockDeviceStorageAttachment {
                     path: path_to_proto(path),
                     read_only,
                 })
             }
-            VmStorageAttachment::ProviderProvisioned {
+            StorageAttachment::ProviderProvisioned {
                 id,
                 device,
                 read_only,
@@ -704,11 +692,11 @@ impl From<VmStorageAttachment> for attachment_proto::VmStorageAttachment {
     }
 }
 
-impl TryFrom<attachment_proto::VmStorageAttachment> for VmStorageAttachment {
+impl TryFrom<attachment_proto::StorageAttachment> for StorageAttachment {
     type Error = VmLifecycleError;
 
-    fn try_from(value: attachment_proto::VmStorageAttachment) -> Result<Self, Self::Error> {
-        use attachment_proto::vm_storage_attachment::Kind;
+    fn try_from(value: attachment_proto::StorageAttachment) -> Result<Self, Self::Error> {
+        use attachment_proto::storage_attachment::Kind;
 
         match value.kind {
             Some(Kind::HostFile(attachment)) => Ok(Self::HostFile {
@@ -731,12 +719,12 @@ impl TryFrom<attachment_proto::VmStorageAttachment> for VmStorageAttachment {
     }
 }
 
-impl From<VmNetworkAttachment> for attachment_proto::VmNetworkAttachment {
-    fn from(value: VmNetworkAttachment) -> Self {
-        use attachment_proto::vm_network_attachment::Kind;
+impl From<NetworkAttachment> for attachment_proto::NetworkAttachment {
+    fn from(value: NetworkAttachment) -> Self {
+        use attachment_proto::network_attachment::Kind;
 
         let kind = match value {
-            VmNetworkAttachment::Tap {
+            NetworkAttachment::Tap {
                 ifname,
                 guest_ip,
                 host_ip,
@@ -749,10 +737,10 @@ impl From<VmNetworkAttachment> for attachment_proto::VmNetworkAttachment {
                 mac,
                 gateway_port: gateway_port.map(u32::from),
             }),
-            VmNetworkAttachment::VfioPci { bdf, mac } => {
+            NetworkAttachment::VfioPci { bdf, mac } => {
                 Kind::VfioPci(attachment_proto::VfioPciNetworkAttachment { bdf, mac })
             }
-            VmNetworkAttachment::Vdpa { device, mac } => {
+            NetworkAttachment::Vdpa { device, mac } => {
                 Kind::Vdpa(attachment_proto::VdpaNetworkAttachment {
                     device: path_to_proto(device),
                     mac,
@@ -763,11 +751,11 @@ impl From<VmNetworkAttachment> for attachment_proto::VmNetworkAttachment {
     }
 }
 
-impl TryFrom<attachment_proto::VmNetworkAttachment> for VmNetworkAttachment {
+impl TryFrom<attachment_proto::NetworkAttachment> for NetworkAttachment {
     type Error = VmLifecycleError;
 
-    fn try_from(value: attachment_proto::VmNetworkAttachment) -> Result<Self, Self::Error> {
-        use attachment_proto::vm_network_attachment::Kind;
+    fn try_from(value: attachment_proto::NetworkAttachment) -> Result<Self, Self::Error> {
+        use attachment_proto::network_attachment::Kind;
 
         match value.kind {
             Some(Kind::Tap(attachment)) => {
@@ -776,7 +764,7 @@ impl TryFrom<attachment_proto::VmNetworkAttachment> for VmNetworkAttachment {
                     .map(|gateway_port| {
                         u16::try_from(gateway_port).map_err(|_| {
                             VmLifecycleError::new(format!(
-                                "VM attachment TAP gateway port {gateway_port} exceeds u16"
+                                "attachment TAP gateway port {gateway_port} exceeds u16"
                             ))
                         })
                     })
@@ -798,21 +786,21 @@ impl TryFrom<attachment_proto::VmNetworkAttachment> for VmNetworkAttachment {
                 mac: attachment.mac,
             }),
             None => Err(VmLifecycleError::new(
-                "VM attachment network attachment missing kind",
+                "attachment network attachment missing kind",
             )),
         }
     }
 }
 
-impl From<VmDeviceAttachment> for attachment_proto::VmDeviceAttachment {
-    fn from(value: VmDeviceAttachment) -> Self {
-        use attachment_proto::vm_device_attachment::Kind;
+impl From<DeviceAttachment> for attachment_proto::DeviceAttachment {
+    fn from(value: DeviceAttachment) -> Self {
+        use attachment_proto::device_attachment::Kind;
 
         let kind = match value {
-            VmDeviceAttachment::VfioPci { bdf, id } => {
+            DeviceAttachment::VfioPci { bdf, id } => {
                 Kind::VfioPci(attachment_proto::VfioPciDeviceAttachment { bdf, id })
             }
-            VmDeviceAttachment::Vsock { cid } => {
+            DeviceAttachment::Vsock { cid } => {
                 Kind::Vsock(attachment_proto::VsockDeviceAttachment { cid })
             }
         };
@@ -820,11 +808,11 @@ impl From<VmDeviceAttachment> for attachment_proto::VmDeviceAttachment {
     }
 }
 
-impl TryFrom<attachment_proto::VmDeviceAttachment> for VmDeviceAttachment {
+impl TryFrom<attachment_proto::DeviceAttachment> for DeviceAttachment {
     type Error = VmLifecycleError;
 
-    fn try_from(value: attachment_proto::VmDeviceAttachment) -> Result<Self, Self::Error> {
-        use attachment_proto::vm_device_attachment::Kind;
+    fn try_from(value: attachment_proto::DeviceAttachment) -> Result<Self, Self::Error> {
+        use attachment_proto::device_attachment::Kind;
 
         match value.kind {
             Some(Kind::VfioPci(attachment)) => Ok(Self::VfioPci {
@@ -835,7 +823,7 @@ impl TryFrom<attachment_proto::VmDeviceAttachment> for VmDeviceAttachment {
                 cid: attachment.cid,
             }),
             None => Err(VmLifecycleError::new(
-                "VM attachment device attachment missing kind",
+                "attachment device attachment missing kind",
             )),
         }
     }
@@ -844,7 +832,7 @@ impl TryFrom<attachment_proto::VmDeviceAttachment> for VmDeviceAttachment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attachments::VmStorageAttachment;
+    use crate::attachments::StorageAttachment;
     use crate::extension::{VmLifecycleExtensions, extension_state_path};
     use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
     use std::collections::HashMap;
@@ -860,7 +848,7 @@ mod tests {
         let state_dir = unique_temp_dir();
         std::fs::create_dir_all(&state_dir).unwrap();
         let detached = Arc::new(Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingVmAttachmentProvider {
+        let provider = Arc::new(RecordingAttachmentProvider {
             plan: vm_attachment_plan(),
             detached: detached.clone(),
         });
@@ -882,14 +870,14 @@ mod tests {
 
         assert_eq!(
             plan.network,
-            vec![VmNetworkAttachment::Vdpa {
+            vec![NetworkAttachment::Vdpa {
                 device: PathBuf::from("/dev/vhost-vdpa-0"),
                 mac: Some("02:00:00:00:00:02".to_string()),
             }]
         );
         assert!(matches!(
             plan.rootfs.root,
-            VmStorageAttachment::ProviderProvisioned { .. }
+            StorageAttachment::ProviderProvisioned { .. }
         ));
         assert!(
             plan.env
@@ -916,7 +904,7 @@ mod tests {
 
     #[test]
     fn static_vm_attachment_provider_config_parses_attachment_template() {
-        let config: StaticVmAttachmentProviderConfig = serde_json::from_str(
+        let config: StaticAttachmentProviderConfig = serde_json::from_str(
             r#"{
                 "attachment_id_prefix": "bf",
                 "replace_network": true,
@@ -938,7 +926,7 @@ mod tests {
         assert_eq!(config.plan.network.len(), 1);
         assert_eq!(
             config.plan.devices,
-            vec![VmDeviceAttachment::Vsock { cid: 42 }]
+            vec![DeviceAttachment::Vsock { cid: 42 }]
         );
         assert_eq!(
             config.metadata.get("provider").map(String::as_str),
@@ -948,14 +936,12 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_vm_attachment_provider_services_many_sandboxes() {
-        let server = FakeVmAttachmentProviderServer::default();
+        let server = FakeAttachmentProviderServer::default();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let incoming = TcpListenerStream::new(listener);
         let service =
-            attachment_proto::vm_attachment_provider_server::VmAttachmentProviderServer::new(
-                server,
-            );
+            attachment_proto::attachment_provider_server::AttachmentProviderServer::new(server);
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
@@ -963,7 +949,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let provider = GrpcVmAttachmentProvider::connect_lazy(format!("http://{address}")).unwrap();
+        let provider = GrpcAttachmentProvider::connect_lazy(format!("http://{address}")).unwrap();
 
         let first = provider
             .attach(attachment_request("sandbox-a"))
@@ -986,26 +972,23 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct RecordingVmAttachmentProvider {
-        plan: VmAttachmentPlan,
+    struct RecordingAttachmentProvider {
+        plan: AttachmentPlan,
         detached: Arc<Mutex<Vec<String>>>,
     }
 
     #[tonic::async_trait]
-    impl VmAttachmentProvider for RecordingVmAttachmentProvider {
-        async fn health(&self) -> VmLifecycleResult<VmAttachmentProviderHealth> {
-            Ok(VmAttachmentProviderHealth {
+    impl AttachmentProvider for RecordingAttachmentProvider {
+        async fn health(&self) -> VmLifecycleResult<AttachmentProviderHealth> {
+            Ok(AttachmentProviderHealth {
                 healthy: true,
                 message: "recording".to_string(),
                 capabilities: Vec::new(),
             })
         }
 
-        async fn attach(
-            &self,
-            request: VmAttachmentRequest,
-        ) -> VmLifecycleResult<VmAttachmentLease> {
-            Ok(VmAttachmentLease {
+        async fn attach(&self, request: AttachmentRequest) -> VmLifecycleResult<AttachmentLease> {
+            Ok(AttachmentLease {
                 attachment_id: format!("lease-{}", request.sandbox_id),
                 generation: 1,
                 plan: self.plan.clone(),
@@ -1013,31 +996,28 @@ mod tests {
             })
         }
 
-        async fn detach(&self, lease: VmAttachmentLease) -> VmLifecycleResult<()> {
+        async fn detach(&self, lease: AttachmentLease) -> VmLifecycleResult<()> {
             self.detached.lock().unwrap().push(lease.attachment_id);
             Ok(())
         }
 
-        async fn list(&self) -> VmLifecycleResult<Vec<VmAttachmentLease>> {
+        async fn list(&self) -> VmLifecycleResult<Vec<AttachmentLease>> {
             Ok(Vec::new())
         }
 
-        async fn reconcile(
-            &self,
-            _lease: VmAttachmentLease,
-        ) -> VmLifecycleResult<ReconcileOutcome> {
+        async fn reconcile(&self, _lease: AttachmentLease) -> VmLifecycleResult<ReconcileOutcome> {
             Ok(ReconcileOutcome::Continue)
         }
     }
 
     #[derive(Debug, Default)]
-    struct FakeVmAttachmentProviderServer {
-        leases: tokio::sync::Mutex<HashMap<String, attachment_proto::VmAttachmentLease>>,
+    struct FakeAttachmentProviderServer {
+        leases: tokio::sync::Mutex<HashMap<String, attachment_proto::AttachmentLease>>,
     }
 
     #[tonic::async_trait]
-    impl attachment_proto::vm_attachment_provider_server::VmAttachmentProvider
-        for FakeVmAttachmentProviderServer
+    impl attachment_proto::attachment_provider_server::AttachmentProvider
+        for FakeAttachmentProviderServer
     {
         async fn health(
             &self,
@@ -1054,15 +1034,15 @@ mod tests {
             &self,
             request: Request<attachment_proto::AttachRequest>,
         ) -> Result<Response<attachment_proto::AttachResponse>, Status> {
-            let request = VmAttachmentRequest::try_from(request.into_inner())
+            let request = AttachmentRequest::try_from(request.into_inner())
                 .map_err(|err| Status::invalid_argument(err.message().to_string()))?;
-            let lease = VmAttachmentLease {
+            let lease = AttachmentLease {
                 attachment_id: format!("lease-{}", request.sandbox_id),
                 generation: 1,
                 plan: vm_attachment_plan(),
                 metadata: BTreeMap::from([("server".to_string(), "fake".to_string())]),
             };
-            let lease = attachment_proto::VmAttachmentLease::from(lease);
+            let lease = attachment_proto::AttachmentLease::from(lease);
             self.leases
                 .lock()
                 .await
@@ -1118,8 +1098,8 @@ mod tests {
         }
     }
 
-    fn attachment_request(sandbox_id: &str) -> VmAttachmentRequest {
-        VmAttachmentRequest {
+    fn attachment_request(sandbox_id: &str) -> AttachmentRequest {
+        AttachmentRequest {
             sandbox_id: sandbox_id.to_string(),
             sandbox_name: sandbox_id.to_string(),
             image_ref: Some("image".to_string()),
@@ -1131,24 +1111,24 @@ mod tests {
         }
     }
 
-    fn vm_attachment_plan() -> VmAttachmentPlan {
-        VmAttachmentPlan {
+    fn vm_attachment_plan() -> AttachmentPlan {
+        AttachmentPlan {
             replace_network: true,
-            network: vec![VmNetworkAttachment::Vdpa {
+            network: vec![NetworkAttachment::Vdpa {
                 device: PathBuf::from("/dev/vhost-vdpa-0"),
                 mac: Some("02:00:00:00:00:02".to_string()),
             }],
-            devices: vec![VmDeviceAttachment::VfioPci {
+            devices: vec![DeviceAttachment::VfioPci {
                 bdf: "0000:03:00.0".to_string(),
                 id: Some("bluefield-net".to_string()),
             }],
-            rootfs: Some(VmRootfsConfig {
-                root: VmStorageAttachment::ProviderProvisioned {
+            rootfs: Some(RootfsConfig {
+                root: StorageAttachment::ProviderProvisioned {
                     id: "rootfs-1".to_string(),
                     device: PathBuf::from("/dev/disk/by-id/nvme-rootfs-1"),
                     read_only: true,
                 },
-                overlay: VmStorageAttachment::host_file(PathBuf::from("/tmp/overlay.ext4"), false),
+                overlay: StorageAttachment::host_file(PathBuf::from("/tmp/overlay.ext4"), false),
                 image: None,
             }),
             env: vec!["OPENSHELL_VM_ATTACHMENT_PROVIDER=bluefield".to_string()],
@@ -1157,7 +1137,7 @@ mod tests {
 
     fn minimal_qemu_plan() -> VmLaunchPlan {
         VmLaunchPlan {
-            rootfs: VmRootfsConfig::host_files(
+            rootfs: RootfsConfig::host_files(
                 PathBuf::from("/tmp/root.ext4"),
                 PathBuf::from("/tmp/overlay.ext4"),
                 None,
@@ -1170,7 +1150,7 @@ mod tests {
             krun_log_level: 1,
             env: Vec::new(),
             backend: VmBackend::Qemu,
-            network: vec![VmNetworkAttachment::Tap {
+            network: vec![NetworkAttachment::Tap {
                 ifname: "vmtap0".to_string(),
                 guest_ip: "10.0.0.2".to_string(),
                 host_ip: "10.0.0.1".to_string(),

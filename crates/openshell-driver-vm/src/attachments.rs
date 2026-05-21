@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum VmStorageAttachment {
+pub enum StorageAttachment {
     HostFile {
         path: PathBuf,
         #[serde(default)]
@@ -25,7 +25,7 @@ pub enum VmStorageAttachment {
     },
 }
 
-impl VmStorageAttachment {
+impl StorageAttachment {
     pub fn host_file(path: PathBuf, read_only: bool) -> Self {
         Self::HostFile { path, read_only }
     }
@@ -51,26 +51,26 @@ impl VmStorageAttachment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VmRootfsConfig {
-    pub root: VmStorageAttachment,
-    pub overlay: VmStorageAttachment,
+pub struct RootfsConfig {
+    pub root: StorageAttachment,
+    pub overlay: StorageAttachment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<VmStorageAttachment>,
+    pub image: Option<StorageAttachment>,
 }
 
-impl VmRootfsConfig {
+impl RootfsConfig {
     pub fn host_files(root: PathBuf, overlay: PathBuf, image: Option<PathBuf>) -> Self {
         Self {
-            root: VmStorageAttachment::host_file(root, true),
-            overlay: VmStorageAttachment::host_file(overlay, false),
-            image: image.map(|path| VmStorageAttachment::host_file(path, true)),
+            root: StorageAttachment::host_file(root, true),
+            overlay: StorageAttachment::host_file(overlay, false),
+            image: image.map(|path| StorageAttachment::host_file(path, true)),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum VmNetworkAttachment {
+pub enum NetworkAttachment {
     Tap {
         ifname: String,
         guest_ip: String,
@@ -93,7 +93,7 @@ pub enum VmNetworkAttachment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum VmDeviceAttachment {
+pub enum DeviceAttachment {
     VfioPci {
         bdf: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

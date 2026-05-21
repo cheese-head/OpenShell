@@ -15,14 +15,12 @@ mod rootfs;
 mod runtime;
 
 pub use attachment_provider::{
-    GrpcVmAttachmentProvider, GrpcVmAttachmentProviderConfig, StaticVmAttachmentProvider,
-    StaticVmAttachmentProviderConfig, VM_ATTACHMENT_LIFECYCLE_EXTENSION_NAME, VmAttachmentLease,
-    VmAttachmentLifecycleExtension, VmAttachmentPlan, VmAttachmentProvider,
-    VmAttachmentProviderClientTlsConfig, VmAttachmentProviderHealth, VmAttachmentRequest,
+    AttachmentLease, AttachmentPlan, AttachmentProvider, AttachmentProviderClientTlsConfig,
+    AttachmentProviderHealth, AttachmentRequest, GrpcAttachmentProvider,
+    GrpcAttachmentProviderConfig, StaticAttachmentProvider, StaticAttachmentProviderConfig,
+    VM_ATTACHMENT_LIFECYCLE_EXTENSION_NAME, VmAttachmentLifecycleExtension,
 };
-pub use attachments::{
-    VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig, VmStorageAttachment,
-};
+pub use attachments::{DeviceAttachment, NetworkAttachment, RootfsConfig, StorageAttachment};
 pub use driver::{VmDriver, VmDriverConfig};
 pub use extension::{
     ExtensionStateMap, LaunchAbortReason, NoopVmLifecycleExtension, PersistedExtensionState,

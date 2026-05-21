@@ -150,12 +150,18 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
 | `guest_tls_cert` | unset | Guest client certificate. |
 | `guest_tls_key` | unset | Guest client private key. |
-| `attachment_provider_endpoint` | unset | gRPC endpoint for a VM attachment provider service. Mutually exclusive with `attachment_provider_config`. |
-| `attachment_provider_config` | unset | Static VM attachment provider JSON config for local OpenShell-side validation. Mutually exclusive with `attachment_provider_endpoint`. |
+| `attachment_provider_endpoint` | unset | gRPC endpoint for an attachment provider service. Mutually exclusive with `attachment_provider_config`. |
+| `attachment_provider_config` | unset | Static attachment provider JSON config for local OpenShell-side validation. Mutually exclusive with `attachment_provider_endpoint`. |
 | `attachment_provider_tls_ca` | unset | CA certificate for the attachment provider mTLS client bundle. Required when `attachment_provider_endpoint` uses `https://`. |
 | `attachment_provider_tls_cert` | unset | Client certificate for the attachment provider mTLS client bundle. Required when `attachment_provider_endpoint` uses `https://`. |
 | `attachment_provider_tls_key` | unset | Client private key for the attachment provider mTLS client bundle. Required when `attachment_provider_endpoint` uses `https://`. |
 | `attachment_provider_tls_server_name` | unset | Optional TLS server name override for the attachment provider endpoint. |
+
+The BlueField attachment provider uses this endpoint path to supply QEMU
+`vfio-pci` network attachments backed by BlueField VFs. See the
+[BlueField Attachment Provider](../../docs/reference/bluefield-attachment-provider.mdx)
+reference and the sample
+[`openshell-bluefield-provider.toml`](../../examples/bluefield/openshell-bluefield-provider.toml).
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
@@ -206,19 +212,19 @@ same host-file rootfs plus TAP/vsock plan as before; hardware-specific
 extensions can replace those typed attachments without relying on raw QEMU
 argument injection.
 
-The crate also includes a generic VM attachment provider lifecycle extension.
-The public API is a `VmAttachmentProvider` trait: the extension asks the
+The crate also includes an attachment provider lifecycle extension for the VM
+driver. The public API is an `AttachmentProvider` trait: the extension asks the
 provider for a per-sandbox attachment lease during `before_vm_launch`, applies
 the returned typed rootfs, network, device, and environment changes to the
 `VmLaunchPlan`, persists the lease in extension state, and detaches it on
 launch failure or sandbox delete.
-The gRPC implementation uses `openshell.vm_attachment.v1.VmAttachmentProvider` from
-[`proto/vm_attachment_provider.proto`](../../proto/vm_attachment_provider.proto).
+The gRPC implementation uses `openshell.attachment.v1.AttachmentProvider` from
+[`proto/attachment_provider.proto`](../../proto/attachment_provider.proto).
 A single provider service can manage many sandbox leases and own external
 resources such as BlueField representors, VF/vDPA devices, provider-exposed
 rootfs devices, and switch rules before QEMU starts.
 
-Configure the gateway to use a VM attachment provider endpoint:
+Configure the gateway to use an attachment provider endpoint:
 
 ```toml
 [openshell.drivers.vm]

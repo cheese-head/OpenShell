@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::attachments::{VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig};
+use crate::attachments::{DeviceAttachment, NetworkAttachment, RootfsConfig};
 use crate::extension::{
     LaunchAbortReason, ReconcileOutcome, VmLaunchPlan, VmLifecycleError, VmLifecycleExtensions,
 };
@@ -640,7 +640,7 @@ impl VmDriver {
         let console_output = state_dir.join("rootfs-console.log");
 
         let mut plan = VmLaunchPlan {
-            rootfs: VmRootfsConfig::host_files(root_disk, overlay_disk, image_disk),
+            rootfs: RootfsConfig::host_files(root_disk, overlay_disk, image_disk),
             exec_path: sandbox_guest_init_path().to_string(),
             workdir: "/".to_string(),
             console_output,
@@ -690,7 +690,7 @@ impl VmDriver {
                 plan.vcpus = self.config.gpu_vcpus;
                 plan.mem_mib = self.config.gpu_mem_mib;
             }
-            plan.network.push(VmNetworkAttachment::Tap {
+            plan.network.push(NetworkAttachment::Tap {
                 ifname: tap,
                 guest_ip: subnet.guest_ip.to_string(),
                 host_ip: subnet.host_ip.to_string(),
@@ -698,9 +698,9 @@ impl VmDriver {
                 gateway_port: gateway_port_from_endpoint(&self.config.openshell_endpoint),
             });
             plan.devices
-                .push(VmDeviceAttachment::Vsock { cid: vsock_cid });
+                .push(DeviceAttachment::Vsock { cid: vsock_cid });
             if let Some(gpu_bdf) = &gpu_bdf {
-                plan.devices.push(VmDeviceAttachment::VfioPci {
+                plan.devices.push(DeviceAttachment::VfioPci {
                     bdf: gpu_bdf.clone(),
                     id: Some("gpu".to_string()),
                 });
@@ -5537,30 +5537,30 @@ mod tests {
     fn launch_command_from_plan_serializes_typed_attachments() {
         let mut plan = minimal_launch_plan();
         plan.backend = VmBackend::Qemu;
-        plan.rootfs = VmRootfsConfig::host_files(
+        plan.rootfs = RootfsConfig::host_files(
             PathBuf::from("/tmp/root.ext4"),
             PathBuf::from("/tmp/overlay.ext4"),
             Some(PathBuf::from("/tmp/image.ext4")),
         );
         plan.network = vec![
-            VmNetworkAttachment::Tap {
+            NetworkAttachment::Tap {
                 ifname: "vmtap-test".to_string(),
                 guest_ip: "10.0.0.2".to_string(),
                 host_ip: "10.0.0.1".to_string(),
                 mac: "02:00:00:00:00:01".to_string(),
                 gateway_port: Some(8443),
             },
-            VmNetworkAttachment::Vdpa {
+            NetworkAttachment::Vdpa {
                 device: PathBuf::from("/dev/vhost-vdpa-0"),
                 mac: Some("02:00:00:00:00:02".to_string()),
             },
         ];
         plan.devices = vec![
-            VmDeviceAttachment::VfioPci {
+            DeviceAttachment::VfioPci {
                 bdf: "0000:03:00.0".to_string(),
                 id: Some("gpu".to_string()),
             },
-            VmDeviceAttachment::Vsock { cid: 42 },
+            DeviceAttachment::Vsock { cid: 42 },
         ];
 
         let args =
@@ -5568,17 +5568,16 @@ mod tests {
 
         let rootfs_values = command_arg_values(&args, "--vm-rootfs-config");
         assert_eq!(rootfs_values.len(), 1);
-        let rootfs: VmRootfsConfig = serde_json::from_str(&rootfs_values[0]).unwrap();
+        let rootfs: RootfsConfig = serde_json::from_str(&rootfs_values[0]).unwrap();
         assert_eq!(rootfs, plan.rootfs);
 
-        let network: Vec<VmNetworkAttachment> =
-            command_arg_values(&args, "--vm-network-attachment")
-                .into_iter()
-                .map(|value| serde_json::from_str(&value).unwrap())
-                .collect();
+        let network: Vec<NetworkAttachment> = command_arg_values(&args, "--vm-network-attachment")
+            .into_iter()
+            .map(|value| serde_json::from_str(&value).unwrap())
+            .collect();
         assert_eq!(network, plan.network);
 
-        let devices: Vec<VmDeviceAttachment> = command_arg_values(&args, "--vm-device-attachment")
+        let devices: Vec<DeviceAttachment> = command_arg_values(&args, "--vm-device-attachment")
             .into_iter()
             .map(|value| serde_json::from_str(&value).unwrap())
             .collect();
@@ -6208,7 +6207,7 @@ mod tests {
 
     fn minimal_launch_plan() -> VmLaunchPlan {
         VmLaunchPlan {
-            rootfs: VmRootfsConfig::host_files(
+            rootfs: RootfsConfig::host_files(
                 PathBuf::from("/tmp/root.ext4"),
                 PathBuf::from("/tmp/overlay.ext4"),
                 None,

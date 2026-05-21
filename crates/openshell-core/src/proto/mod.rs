@@ -62,9 +62,9 @@ pub mod compute {
     unused_qualifications,
     rust_2018_idioms
 )]
-pub mod vm_attachment {
+pub mod attachment {
     pub mod v1 {
-        include!(concat!(env!("OUT_DIR"), "/openshell.vm_attachment.v1.rs"));
+        include!(concat!(env!("OUT_DIR"), "/openshell.attachment.v1.rs"));
     }
 }
 

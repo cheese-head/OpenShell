@@ -7,11 +7,10 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_vm::{
-    GrpcVmAttachmentProvider, GrpcVmAttachmentProviderConfig, StaticVmAttachmentProvider,
-    StaticVmAttachmentProviderConfig, VmAttachmentLifecycleExtension,
-    VmAttachmentProviderClientTlsConfig, VmBackend, VmDeviceAttachment, VmDriver, VmDriverConfig,
-    VmLaunchConfig, VmLifecycleExtension, VmLifecycleExtensions, VmNetworkAttachment,
-    VmRootfsConfig, procguard, run_vm,
+    AttachmentProviderClientTlsConfig, DeviceAttachment, GrpcAttachmentProvider,
+    GrpcAttachmentProviderConfig, NetworkAttachment, RootfsConfig, StaticAttachmentProvider,
+    StaticAttachmentProviderConfig, VmAttachmentLifecycleExtension, VmBackend, VmDriver,
+    VmDriverConfig, VmLaunchConfig, VmLifecycleExtension, VmLifecycleExtensions, procguard, run_vm,
 };
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
@@ -164,10 +163,10 @@ struct Args {
     vm_gateway_port: Option<u16>,
 
     #[arg(long = "vm-network-attachment", hide = true)]
-    vm_network_attachment: Vec<String>,
+    network_attachment: Vec<String>,
 
     #[arg(long = "vm-device-attachment", hide = true)]
-    vm_device_attachment: Vec<String>,
+    device_attachment: Vec<String>,
 
     #[arg(
         long = "vm-attachment-provider-config",
@@ -351,7 +350,7 @@ fn vm_lifecycle_extensions(args: &Args) -> std::result::Result<VmLifecycleExtens
         }
         (Some(endpoint), None) => {
             let provider = Arc::new(
-                GrpcVmAttachmentProvider::connect_lazy_with_config(vm_attachment_provider_config(
+                GrpcAttachmentProvider::connect_lazy_with_config(vm_attachment_provider_config(
                     args, endpoint,
                 )?)
                 .map_err(|err| err.message().to_string())?,
@@ -365,21 +364,21 @@ fn vm_lifecycle_extensions(args: &Args) -> std::result::Result<VmLifecycleExtens
                 || args.vm_attachment_provider_tls_server_name.is_some() =>
         {
             return Err(
-                "--vm-attachment-provider-endpoint is required with VM attachment provider TLS options"
+                "--vm-attachment-provider-endpoint is required with attachment provider TLS options"
                     .to_string(),
             );
         }
         (None, Some(config_path)) => {
             let config_bytes = std::fs::read(config_path)
                 .map_err(|err| format!("read {}: {err}", config_path.display()))?;
-            let config: StaticVmAttachmentProviderConfig = serde_json::from_slice(&config_bytes)
+            let config: StaticAttachmentProviderConfig = serde_json::from_slice(&config_bytes)
                 .map_err(|err| {
                     format!(
                         "decode VM attachment lifecycle config {}: {err}",
                         config_path.display()
                     )
                 })?;
-            let provider = Arc::new(StaticVmAttachmentProvider::new(config));
+            let provider = Arc::new(StaticAttachmentProvider::new(config));
             extensions.push(Arc::new(VmAttachmentLifecycleExtension::new(provider)));
         }
         (None, None) => {}
@@ -392,8 +391,8 @@ fn vm_lifecycle_extensions(args: &Args) -> std::result::Result<VmLifecycleExtens
 fn vm_attachment_provider_config(
     args: &Args,
     endpoint: &str,
-) -> std::result::Result<GrpcVmAttachmentProviderConfig, String> {
-    Ok(GrpcVmAttachmentProviderConfig {
+) -> std::result::Result<GrpcAttachmentProviderConfig, String> {
+    Ok(GrpcAttachmentProviderConfig {
         endpoint: endpoint.to_string(),
         tls: vm_attachment_provider_tls_config(args, endpoint)?,
     })
@@ -402,7 +401,7 @@ fn vm_attachment_provider_config(
 fn vm_attachment_provider_tls_config(
     args: &Args,
     endpoint: &str,
-) -> std::result::Result<Option<VmAttachmentProviderClientTlsConfig>, String> {
+) -> std::result::Result<Option<AttachmentProviderClientTlsConfig>, String> {
     let requires_tls = endpoint.starts_with("https://")
         || args.vm_attachment_provider_tls_ca.is_some()
         || args.vm_attachment_provider_tls_cert.is_some()
@@ -413,25 +412,24 @@ fn vm_attachment_provider_tls_config(
     }
     if !endpoint.starts_with("https://") {
         return Err(
-            "--vm-attachment-provider-endpoint must use https:// when VM attachment provider TLS is configured"
+            "--vm-attachment-provider-endpoint must use https:// when attachment provider TLS is configured"
                 .to_string(),
         );
     }
 
     let ca_cert = args.vm_attachment_provider_tls_ca.clone().ok_or_else(|| {
-        "--vm-attachment-provider-tls-ca is required for VM attachment provider TLS".to_string()
+        "--vm-attachment-provider-tls-ca is required for attachment provider TLS".to_string()
     })?;
     let client_cert = args
         .vm_attachment_provider_tls_cert
         .clone()
         .ok_or_else(|| {
-            "--vm-attachment-provider-tls-cert is required for VM attachment provider TLS"
-                .to_string()
+            "--vm-attachment-provider-tls-cert is required for attachment provider TLS".to_string()
         })?;
     let client_key = args.vm_attachment_provider_tls_key.clone().ok_or_else(|| {
-        "--vm-attachment-provider-tls-key is required for VM attachment provider TLS".to_string()
+        "--vm-attachment-provider-tls-key is required for attachment provider TLS".to_string()
     })?;
-    Ok(Some(VmAttachmentProviderClientTlsConfig {
+    Ok(Some(AttachmentProviderClientTlsConfig {
         ca_cert,
         client_cert,
         client_key,
@@ -613,7 +611,7 @@ impl Stream for AuthenticatedUnixIncoming {
 
 fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, String> {
     let rootfs = if let Some(config) = args.vm_rootfs_config.as_deref() {
-        serde_json::from_str::<VmRootfsConfig>(config)
+        serde_json::from_str::<RootfsConfig>(config)
             .map_err(|err| format!("invalid --vm-rootfs-config: {err}"))?
     } else {
         let root_disk = args
@@ -624,7 +622,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
             .vm_overlay_disk
             .clone()
             .ok_or_else(|| "--vm-overlay-disk is required in internal VM mode".to_string())?;
-        VmRootfsConfig::host_files(root_disk, overlay_disk, args.vm_image_disk.clone())
+        RootfsConfig::host_files(root_disk, overlay_disk, args.vm_image_disk.clone())
     };
     let exec_path = args
         .vm_exec
@@ -640,8 +638,8 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         Some("libkrun") | None => VmBackend::Libkrun,
         Some(other) => return Err(format!("unknown VM backend: {other}")),
     };
-    let network = vm_network_attachments(args)?;
-    let devices = vm_device_attachments(args)?;
+    let network = network_attachments(args)?;
+    let devices = device_attachments(args)?;
 
     Ok(VmLaunchConfig {
         rootfs,
@@ -659,13 +657,13 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
     })
 }
 
-fn vm_network_attachments(args: &Args) -> std::result::Result<Vec<VmNetworkAttachment>, String> {
-    let mut attachments = parse_json_values::<VmNetworkAttachment>(
+fn network_attachments(args: &Args) -> std::result::Result<Vec<NetworkAttachment>, String> {
+    let mut attachments = parse_json_values::<NetworkAttachment>(
         "--vm-network-attachment",
-        &args.vm_network_attachment,
+        &args.network_attachment,
     )?;
     if attachments.is_empty() && args.vm_tap_device.is_some() {
-        attachments.push(VmNetworkAttachment::Tap {
+        attachments.push(NetworkAttachment::Tap {
             ifname: args.vm_tap_device.clone().unwrap_or_default(),
             guest_ip: args.vm_guest_ip.clone().ok_or_else(|| {
                 "--vm-guest-ip is required with legacy --vm-tap-device".to_string()
@@ -682,19 +680,17 @@ fn vm_network_attachments(args: &Args) -> std::result::Result<Vec<VmNetworkAttac
     Ok(attachments)
 }
 
-fn vm_device_attachments(args: &Args) -> std::result::Result<Vec<VmDeviceAttachment>, String> {
-    let mut attachments = parse_json_values::<VmDeviceAttachment>(
-        "--vm-device-attachment",
-        &args.vm_device_attachment,
-    )?;
+fn device_attachments(args: &Args) -> std::result::Result<Vec<DeviceAttachment>, String> {
+    let mut attachments =
+        parse_json_values::<DeviceAttachment>("--vm-device-attachment", &args.device_attachment)?;
     if let Some(gpu_bdf) = &args.vm_gpu_bdf {
-        attachments.push(VmDeviceAttachment::VfioPci {
+        attachments.push(DeviceAttachment::VfioPci {
             bdf: gpu_bdf.clone(),
             id: Some("gpu".to_string()),
         });
     }
     if let Some(cid) = args.vm_vsock_cid {
-        attachments.push(VmDeviceAttachment::Vsock { cid });
+        attachments.push(DeviceAttachment::Vsock { cid });
     }
     Ok(attachments)
 }

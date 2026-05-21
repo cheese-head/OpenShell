@@ -100,22 +100,22 @@ pub struct VmComputeConfig {
     /// Host-side private key for the guest's mTLS client bundle.
     pub guest_tls_key: Option<PathBuf>,
 
-    /// gRPC endpoint for a VM attachment provider service.
+    /// gRPC endpoint for an attachment provider service.
     pub attachment_provider_endpoint: Option<String>,
 
-    /// Static VM attachment provider JSON config used for local OpenShell-side testing.
+    /// Static attachment provider JSON config used for local OpenShell-side testing.
     pub attachment_provider_config: Option<PathBuf>,
 
-    /// CA certificate for the VM attachment provider mTLS client bundle.
+    /// CA certificate for the attachment provider mTLS client bundle.
     pub attachment_provider_tls_ca: Option<PathBuf>,
 
-    /// Client certificate for the VM attachment provider mTLS client bundle.
+    /// Client certificate for the attachment provider mTLS client bundle.
     pub attachment_provider_tls_cert: Option<PathBuf>,
 
-    /// Client private key for the VM attachment provider mTLS client bundle.
+    /// Client private key for the attachment provider mTLS client bundle.
     pub attachment_provider_tls_key: Option<PathBuf>,
 
-    /// Optional TLS server name override for the VM attachment provider.
+    /// Optional TLS server name override for the attachment provider.
     pub attachment_provider_tls_server_name: Option<String>,
 }
 
@@ -572,7 +572,7 @@ pub fn validate_attachment_provider_config(vm_config: &VmComputeConfig) -> Resul
         || vm_config.attachment_provider_tls_server_name.is_some();
     if tls_configured && vm_config.attachment_provider_endpoint.is_none() {
         return Err(Error::config(
-            "attachment_provider_endpoint is required when VM attachment provider TLS is configured",
+            "attachment_provider_endpoint is required when attachment provider TLS is configured",
         ));
     }
 
@@ -582,7 +582,7 @@ pub fn validate_attachment_provider_config(vm_config: &VmComputeConfig) -> Resul
         .is_some_and(|endpoint| endpoint.starts_with("https://"));
     if tls_configured && !endpoint_requires_tls {
         return Err(Error::config(
-            "attachment_provider_endpoint must use https:// when VM attachment provider TLS is configured",
+            "attachment_provider_endpoint must use https:// when attachment provider TLS is configured",
         ));
     }
     if !tls_configured && !endpoint_requires_tls {
@@ -591,23 +591,23 @@ pub fn validate_attachment_provider_config(vm_config: &VmComputeConfig) -> Resul
 
     let Some(ca) = &vm_config.attachment_provider_tls_ca else {
         return Err(Error::config(
-            "attachment_provider_tls_ca is required when VM attachment provider TLS is configured",
+            "attachment_provider_tls_ca is required when attachment provider TLS is configured",
         ));
     };
     let Some(cert) = &vm_config.attachment_provider_tls_cert else {
         return Err(Error::config(
-            "attachment_provider_tls_cert is required when VM attachment provider TLS is configured",
+            "attachment_provider_tls_cert is required when attachment provider TLS is configured",
         ));
     };
     let Some(key) = &vm_config.attachment_provider_tls_key else {
         return Err(Error::config(
-            "attachment_provider_tls_key is required when VM attachment provider TLS is configured",
+            "attachment_provider_tls_key is required when attachment provider TLS is configured",
         ));
     };
     for path in [ca, cert, key] {
         if !path.is_file() {
             return Err(Error::config(format!(
-                "vm attachment provider TLS material '{}' does not exist or is not a file",
+                "attachment provider TLS material '{}' does not exist or is not a file",
                 path.display()
             )));
         }

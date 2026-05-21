@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::attachments::{
-    VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig, VmStorageAttachment,
-};
+use crate::attachments::{DeviceAttachment, NetworkAttachment, RootfsConfig, StorageAttachment};
 use crate::runtime::VmBackend;
 use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
 use serde::{Deserialize, Serialize};
@@ -147,7 +145,7 @@ impl<'a> VmLifecycleContext<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLaunchPlan {
-    pub rootfs: VmRootfsConfig,
+    pub rootfs: RootfsConfig,
     pub exec_path: String,
     pub workdir: String,
     pub console_output: PathBuf,
@@ -156,8 +154,8 @@ pub struct VmLaunchPlan {
     pub krun_log_level: u32,
     pub env: Vec<String>,
     pub backend: VmBackend,
-    pub network: Vec<VmNetworkAttachment>,
-    pub devices: Vec<VmDeviceAttachment>,
+    pub network: Vec<NetworkAttachment>,
+    pub devices: Vec<DeviceAttachment>,
     pub extra_launcher_args: Vec<String>,
 }
 
@@ -672,7 +670,7 @@ fn validate_qemu_launch_plan(plan: &VmLaunchPlan) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_rootfs_config(rootfs: &VmRootfsConfig) -> Result<(), String> {
+fn validate_rootfs_config(rootfs: &RootfsConfig) -> Result<(), String> {
     validate_storage_attachment("root", &rootfs.root)?;
     validate_storage_attachment("overlay", &rootfs.overlay)?;
     if let Some(image) = &rootfs.image {
@@ -681,15 +679,15 @@ fn validate_rootfs_config(rootfs: &VmRootfsConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_storage_attachment(name: &str, storage: &VmStorageAttachment) -> Result<(), String> {
+fn validate_storage_attachment(name: &str, storage: &StorageAttachment) -> Result<(), String> {
     match storage {
-        VmStorageAttachment::HostFile { path, .. }
-        | VmStorageAttachment::HostBlockDevice { path, .. } => {
+        StorageAttachment::HostFile { path, .. }
+        | StorageAttachment::HostBlockDevice { path, .. } => {
             if path.as_os_str().is_empty() {
                 return Err(format!("VM launch {name} storage path is empty"));
             }
         }
-        VmStorageAttachment::ProviderProvisioned { id, device, .. } => {
+        StorageAttachment::ProviderProvisioned { id, device, .. } => {
             if id.trim().is_empty() {
                 return Err(format!("VM launch {name} provider storage id is empty"));
             }
@@ -703,9 +701,9 @@ fn validate_storage_attachment(name: &str, storage: &VmStorageAttachment) -> Res
     Ok(())
 }
 
-fn validate_network_attachment(network: &VmNetworkAttachment) -> Result<(), String> {
+fn validate_network_attachment(network: &NetworkAttachment) -> Result<(), String> {
     match network {
-        VmNetworkAttachment::Tap {
+        NetworkAttachment::Tap {
             ifname,
             guest_ip,
             host_ip,
@@ -725,12 +723,12 @@ fn validate_network_attachment(network: &VmNetworkAttachment) -> Result<(), Stri
                 return Err("QEMU TAP network attachment requires mac".to_string());
             }
         }
-        VmNetworkAttachment::VfioPci { bdf, .. } => {
+        NetworkAttachment::VfioPci { bdf, .. } => {
             if bdf.trim().is_empty() {
                 return Err("QEMU VFIO network attachment requires bdf".to_string());
             }
         }
-        VmNetworkAttachment::Vdpa { device, .. } => {
+        NetworkAttachment::Vdpa { device, .. } => {
             if device.as_os_str().is_empty() {
                 return Err("QEMU vDPA network attachment requires device".to_string());
             }
@@ -739,14 +737,14 @@ fn validate_network_attachment(network: &VmNetworkAttachment) -> Result<(), Stri
     Ok(())
 }
 
-fn validate_device_attachment(device: &VmDeviceAttachment) -> Result<(), String> {
+fn validate_device_attachment(device: &DeviceAttachment) -> Result<(), String> {
     match device {
-        VmDeviceAttachment::VfioPci { bdf, .. } => {
+        DeviceAttachment::VfioPci { bdf, .. } => {
             if bdf.trim().is_empty() {
                 return Err("QEMU VFIO device attachment requires bdf".to_string());
             }
         }
-        VmDeviceAttachment::Vsock { cid } => {
+        DeviceAttachment::Vsock { cid } => {
             if *cid == 0 {
                 return Err("QEMU vhost-vsock attachment requires a non-zero cid".to_string());
             }
@@ -803,7 +801,7 @@ mod tests {
     #[test]
     fn launch_plan_validation_rejects_reserved_extra_args() {
         let plan = VmLaunchPlan {
-            rootfs: VmRootfsConfig::host_files(
+            rootfs: RootfsConfig::host_files(
                 PathBuf::from("/root.ext4"),
                 PathBuf::from("/overlay.ext4"),
                 None,
@@ -830,7 +828,7 @@ mod tests {
     #[test]
     fn launch_plan_validation_rejects_incomplete_qemu_plan() {
         let plan = VmLaunchPlan {
-            rootfs: VmRootfsConfig::host_files(
+            rootfs: RootfsConfig::host_files(
                 PathBuf::from("/root.ext4"),
                 PathBuf::from("/overlay.ext4"),
                 None,
@@ -857,7 +855,7 @@ mod tests {
     #[test]
     fn launch_plan_validation_accepts_qemu_vfio_network_attachment() {
         let plan = VmLaunchPlan {
-            rootfs: VmRootfsConfig::host_files(
+            rootfs: RootfsConfig::host_files(
                 PathBuf::from("/root.ext4"),
                 PathBuf::from("/overlay.ext4"),
                 None,
@@ -870,7 +868,7 @@ mod tests {
             krun_log_level: 1,
             env: vec!["A=B".to_string()],
             backend: VmBackend::Qemu,
-            network: vec![VmNetworkAttachment::VfioPci {
+            network: vec![NetworkAttachment::VfioPci {
                 bdf: "0000:03:00.2".to_string(),
                 mac: None,
             }],

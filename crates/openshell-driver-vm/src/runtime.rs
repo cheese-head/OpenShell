@@ -10,9 +10,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::attachments::{
-    VmDeviceAttachment, VmNetworkAttachment, VmRootfsConfig, VmStorageAttachment,
-};
+use crate::attachments::{DeviceAttachment, NetworkAttachment, RootfsConfig, StorageAttachment};
 use crate::{embedded_runtime, ffi, nft_ruleset, procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
@@ -48,7 +46,7 @@ const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_UFO;
 
 pub struct VmLaunchConfig {
-    pub rootfs: VmRootfsConfig,
+    pub rootfs: RootfsConfig,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub exec_path: String,
@@ -58,8 +56,8 @@ pub struct VmLaunchConfig {
     pub log_level: u32,
     pub console_output: PathBuf,
     pub backend: VmBackend,
-    pub network: Vec<VmNetworkAttachment>,
-    pub devices: Vec<VmDeviceAttachment>,
+    pub network: Vec<NetworkAttachment>,
+    pub devices: Vec<DeviceAttachment>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -85,7 +83,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     let runtime_dir = qemu_runtime_dir()?;
     let mut tap_guards = Vec::new();
     for network in &config.network {
-        if let VmNetworkAttachment::Tap {
+        if let NetworkAttachment::Tap {
             ifname,
             host_ip,
             gateway_port,
@@ -169,7 +167,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
 }
 
-fn qemu_disk_args(rootfs: &VmRootfsConfig) -> Vec<String> {
+fn qemu_disk_args(rootfs: &RootfsConfig) -> Vec<String> {
     let mut args = qemu_storage_args("rootfs", &rootfs.root);
     args.extend(qemu_storage_args("overlay", &rootfs.overlay));
     if let Some(image) = &rootfs.image {
@@ -178,7 +176,7 @@ fn qemu_disk_args(rootfs: &VmRootfsConfig) -> Vec<String> {
     args
 }
 
-fn qemu_storage_args(id: &str, storage: &VmStorageAttachment) -> Vec<String> {
+fn qemu_storage_args(id: &str, storage: &StorageAttachment) -> Vec<String> {
     let mut drive = format!(
         "file={},if=none,format=raw,id={id}",
         storage.path().display()
@@ -194,14 +192,14 @@ fn qemu_storage_args(id: &str, storage: &VmStorageAttachment) -> Vec<String> {
     ]
 }
 
-fn qemu_network_args(networks: &[VmNetworkAttachment]) -> Vec<String> {
+fn qemu_network_args(networks: &[NetworkAttachment]) -> Vec<String> {
     let mut args = Vec::new();
     for (idx, network) in networks.iter().enumerate() {
         let net_id = format!("net{idx}");
         let root_id = format!("net_root{idx}");
         let slot = 3 + idx;
         match network {
-            VmNetworkAttachment::Tap { ifname, mac, .. } => {
+            NetworkAttachment::Tap { ifname, mac, .. } => {
                 args.extend([
                     "-netdev".to_string(),
                     format!("tap,id={net_id},ifname={ifname},script=no,downscript=no"),
@@ -213,7 +211,7 @@ fn qemu_network_args(networks: &[VmNetworkAttachment]) -> Vec<String> {
                     ),
                 ]);
             }
-            VmNetworkAttachment::VfioPci { bdf, .. } => {
+            NetworkAttachment::VfioPci { bdf, .. } => {
                 args.extend([
                     "-device".to_string(),
                     format!("pcie-root-port,id={root_id},slot={slot}"),
@@ -221,7 +219,7 @@ fn qemu_network_args(networks: &[VmNetworkAttachment]) -> Vec<String> {
                     format!("vfio-pci,host={bdf},bus={root_id}"),
                 ]);
             }
-            VmNetworkAttachment::Vdpa { device, mac } => {
+            NetworkAttachment::Vdpa { device, mac } => {
                 let mut device_arg = format!("virtio-net-pci,netdev={net_id},bus={root_id}");
                 if let Some(mac) = mac {
                     use std::fmt::Write as _;
@@ -241,11 +239,11 @@ fn qemu_network_args(networks: &[VmNetworkAttachment]) -> Vec<String> {
     args
 }
 
-fn qemu_device_args(devices: &[VmDeviceAttachment]) -> Vec<String> {
+fn qemu_device_args(devices: &[DeviceAttachment]) -> Vec<String> {
     let mut args = Vec::new();
     for (idx, device) in devices.iter().enumerate() {
         match device {
-            VmDeviceAttachment::VfioPci { bdf, .. } => {
+            DeviceAttachment::VfioPci { bdf, .. } => {
                 let root_id = format!("dev_root{idx}");
                 let slot = 16 + idx;
                 args.extend([
@@ -255,7 +253,7 @@ fn qemu_device_args(devices: &[VmDeviceAttachment]) -> Vec<String> {
                     format!("vfio-pci,host={bdf},bus={root_id}"),
                 ]);
             }
-            VmDeviceAttachment::Vsock { cid } => {
+            DeviceAttachment::Vsock { cid } => {
                 let root_id = format!("vsock_root{idx}");
                 let slot = 1 + idx;
                 args.extend([
@@ -270,7 +268,7 @@ fn qemu_device_args(devices: &[VmDeviceAttachment]) -> Vec<String> {
     args
 }
 
-fn validate_rootfs_attachments(rootfs: &VmRootfsConfig) -> Result<(), String> {
+fn validate_rootfs_attachments(rootfs: &RootfsConfig) -> Result<(), String> {
     validate_storage_attachment("root disk", &rootfs.root)?;
     validate_storage_attachment("overlay disk", &rootfs.overlay)?;
     if let Some(image) = &rootfs.image {
@@ -279,7 +277,7 @@ fn validate_rootfs_attachments(rootfs: &VmRootfsConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_storage_attachment(name: &str, storage: &VmStorageAttachment) -> Result<(), String> {
+fn validate_storage_attachment(name: &str, storage: &StorageAttachment) -> Result<(), String> {
     let path = storage.path();
     let metadata = std::fs::metadata(path)
         .map_err(|err| format!("{name} not found at {}: {err}", path.display()))?;
@@ -291,9 +289,9 @@ fn validate_storage_attachment(name: &str, storage: &VmStorageAttachment) -> Res
 
 fn libkrun_host_file_path<'a>(
     name: &str,
-    storage: &'a VmStorageAttachment,
+    storage: &'a StorageAttachment,
 ) -> Result<&'a Path, String> {
-    let VmStorageAttachment::HostFile { path, .. } = storage else {
+    let StorageAttachment::HostFile { path, .. } = storage else {
         return Err(format!("{name} must be a host file for libkrun"));
     };
     validate_storage_attachment(name, storage)?;
@@ -369,9 +367,9 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
     parts.join(" ")
 }
 
-fn first_tap_guest_host_ips(networks: &[VmNetworkAttachment]) -> Option<(&str, &str)> {
+fn first_tap_guest_host_ips(networks: &[NetworkAttachment]) -> Option<(&str, &str)> {
     networks.iter().find_map(|network| {
-        if let VmNetworkAttachment::Tap {
+        if let NetworkAttachment::Tap {
             guest_ip, host_ip, ..
         } = network
         {
@@ -382,11 +380,11 @@ fn first_tap_guest_host_ips(networks: &[VmNetworkAttachment]) -> Option<(&str, &
     })
 }
 
-fn has_gpu_attachment(devices: &[VmDeviceAttachment]) -> bool {
+fn has_gpu_attachment(devices: &[DeviceAttachment]) -> bool {
     devices.iter().any(|device| {
         matches!(
             device,
-            VmDeviceAttachment::VfioPci { id: Some(id), .. } if id == "gpu"
+            DeviceAttachment::VfioPci { id: Some(id), .. } if id == "gpu"
         )
     })
 }
@@ -1452,7 +1450,7 @@ mod tests {
 
     fn qemu_config() -> VmLaunchConfig {
         VmLaunchConfig {
-            rootfs: VmRootfsConfig::host_files(
+            rootfs: RootfsConfig::host_files(
                 PathBuf::from("/rootfs.ext4"),
                 PathBuf::from("/overlay.ext4"),
                 None,
@@ -1466,7 +1464,7 @@ mod tests {
             log_level: 0,
             console_output: PathBuf::from("/console.log"),
             backend: VmBackend::Qemu,
-            network: vec![VmNetworkAttachment::Tap {
+            network: vec![NetworkAttachment::Tap {
                 ifname: "vmtap-test".to_string(),
                 guest_ip: "10.0.128.2".to_string(),
                 host_ip: "10.0.128.1".to_string(),
@@ -1474,11 +1472,11 @@ mod tests {
                 gateway_port: Some(8080),
             }],
             devices: vec![
-                VmDeviceAttachment::VfioPci {
+                DeviceAttachment::VfioPci {
                     bdf: "0000:01:00.0".to_string(),
                     id: Some("gpu".to_string()),
                 },
-                VmDeviceAttachment::Vsock { cid: 4 },
+                DeviceAttachment::Vsock { cid: 4 },
             ],
         }
     }
@@ -1500,7 +1498,7 @@ mod tests {
         config.devices.retain(|device| {
             !matches!(
                 device,
-                VmDeviceAttachment::VfioPci { id: Some(id), .. } if id == "gpu"
+                DeviceAttachment::VfioPci { id: Some(id), .. } if id == "gpu"
             )
         });
 
@@ -1547,7 +1545,7 @@ mod tests {
     #[test]
     fn qemu_disk_args_attach_prepared_image_readonly_when_present() {
         let mut config = qemu_config();
-        config.rootfs.image = Some(VmStorageAttachment::host_file(
+        config.rootfs.image = Some(StorageAttachment::host_file(
             PathBuf::from("/image-rootfs.ext4"),
             true,
         ));
@@ -1562,13 +1560,13 @@ mod tests {
 
     #[test]
     fn qemu_disk_args_support_provider_provisioned_rootfs() {
-        let rootfs = VmRootfsConfig {
-            root: VmStorageAttachment::ProviderProvisioned {
+        let rootfs = RootfsConfig {
+            root: StorageAttachment::ProviderProvisioned {
                 id: "provider-rootfs-1".to_string(),
                 device: PathBuf::from("/dev/disk/by-id/provider-rootfs"),
                 read_only: true,
             },
-            overlay: VmStorageAttachment::host_file(PathBuf::from("/overlay.ext4"), false),
+            overlay: StorageAttachment::host_file(PathBuf::from("/overlay.ext4"), false),
             image: None,
         };
 
@@ -1586,11 +1584,11 @@ mod tests {
     #[test]
     fn qemu_network_args_support_vfio_and_vdpa() {
         let args = qemu_network_args(&[
-            VmNetworkAttachment::VfioPci {
+            NetworkAttachment::VfioPci {
                 bdf: "0000:03:00.2".to_string(),
                 mac: None,
             },
-            VmNetworkAttachment::Vdpa {
+            NetworkAttachment::Vdpa {
                 device: PathBuf::from("/dev/vhost-vdpa-0"),
                 mac: Some("02:00:00:00:00:02".to_string()),
             },
@@ -1606,11 +1604,11 @@ mod tests {
     #[test]
     fn qemu_device_args_support_vfio_and_vsock() {
         let args = qemu_device_args(&[
-            VmDeviceAttachment::VfioPci {
+            DeviceAttachment::VfioPci {
                 bdf: "0000:01:00.0".to_string(),
                 id: Some("gpu".to_string()),
             },
-            VmDeviceAttachment::Vsock { cid: 4 },
+            DeviceAttachment::Vsock { cid: 4 },
         ]);
 
         assert!(args.contains(&"vfio-pci,host=0000:01:00.0,bus=dev_root0".to_string()));

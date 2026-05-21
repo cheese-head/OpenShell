@@ -3,16 +3,16 @@
 
 syntax = "proto3";
 
-package openshell.vm_attachment.v1;
+package openshell.attachment.v1;
 
-// VM attachment provider contract consumed by VM lifecycle extensions.
+// Generic attachment provider contract consumed by compute lifecycle extensions.
 //
 // The provider owns external resources for many OpenShell sandboxes: VF/vDPA
 // allocation, rootfs exposure, representor discovery, OVS/OpenFlow or
-// equivalent switch programming, and cleanup. The VM driver remains the host
-// QEMU launcher; it asks the provider for typed launch attachments and applies
-// them to its local VmLaunchPlan.
-service VmAttachmentProvider {
+// equivalent switch programming, and cleanup. Compute drivers remain responsible
+// for launching workloads; they ask the provider for typed attachments and
+// translate the returned plan into their local launch mechanism.
+service AttachmentProvider {
   rpc Health(HealthRequest) returns (HealthResponse);
   rpc Attach(AttachRequest) returns (AttachResponse);
   rpc Detach(DetachRequest) returns (DetachResponse);
@@ -32,18 +32,18 @@ message AttachRequest {
   string sandbox_id = 1;
   string sandbox_name = 2;
   optional string image_ref = 3;
-  string backend = 4;
-  VmRootfsConfig rootfs = 5;
-  repeated VmNetworkAttachment network = 6;
-  repeated VmDeviceAttachment devices = 7;
+  string consumer = 4;
+  RootfsConfig rootfs = 5;
+  repeated NetworkAttachment network = 6;
+  repeated DeviceAttachment devices = 7;
 }
 
 message AttachResponse {
-  VmAttachmentLease lease = 1;
+  AttachmentLease lease = 1;
 }
 
 message DetachRequest {
-  VmAttachmentLease lease = 1;
+  AttachmentLease lease = 1;
 }
 
 message DetachResponse {}
@@ -51,11 +51,11 @@ message DetachResponse {}
 message ListRequest {}
 
 message ListResponse {
-  repeated VmAttachmentLease leases = 1;
+  repeated AttachmentLease leases = 1;
 }
 
 message ReconcileRequest {
-  VmAttachmentLease lease = 1;
+  AttachmentLease lease = 1;
 }
 
 message ReconcileResponse {
@@ -69,28 +69,28 @@ enum ReconcileOutcome {
   RECONCILE_OUTCOME_SKIP_RESTORE = 2;
 }
 
-message VmAttachmentLease {
+message AttachmentLease {
   string attachment_id = 1;
   uint64 generation = 2;
-  VmAttachmentPlan plan = 3;
+  AttachmentPlan plan = 3;
   map<string, string> metadata = 4;
 }
 
-message VmAttachmentPlan {
+message AttachmentPlan {
   bool replace_network = 1;
-  repeated VmNetworkAttachment network = 2;
-  repeated VmDeviceAttachment devices = 3;
-  VmRootfsConfig rootfs = 4;
+  repeated NetworkAttachment network = 2;
+  repeated DeviceAttachment devices = 3;
+  RootfsConfig rootfs = 4;
   repeated string env = 5;
 }
 
-message VmRootfsConfig {
-  VmStorageAttachment root = 1;
-  VmStorageAttachment overlay = 2;
-  VmStorageAttachment image = 3;
+message RootfsConfig {
+  StorageAttachment root = 1;
+  StorageAttachment overlay = 2;
+  StorageAttachment image = 3;
 }
 
-message VmStorageAttachment {
+message StorageAttachment {
   oneof kind {
     HostFileStorageAttachment host_file = 1;
     HostBlockDeviceStorageAttachment host_block_device = 2;
@@ -114,7 +114,7 @@ message ProviderProvisionedStorageAttachment {
   bool read_only = 3;
 }
 
-message VmNetworkAttachment {
+message NetworkAttachment {
   oneof kind {
     TapNetworkAttachment tap = 1;
     VfioPciNetworkAttachment vfio_pci = 2;
@@ -140,7 +140,7 @@ message VdpaNetworkAttachment {
   optional string mac = 2;
 }
 
-message VmDeviceAttachment {
+message DeviceAttachment {
   oneof kind {
     VfioPciDeviceAttachment vfio_pci = 1;
     VsockDeviceAttachment vsock = 2;
