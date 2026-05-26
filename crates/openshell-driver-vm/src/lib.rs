@@ -17,6 +17,6 @@ pub use extension::{
     VmLifecycleResult,
 };
 pub use runtime::{
-    VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,
-    configured_runtime_dir, run_vm,
+    AllocatedPciDevice, VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig,
+    cleanup_stale_tap_interfaces, configured_runtime_dir, run_vm,
 };

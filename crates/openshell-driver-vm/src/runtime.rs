@@ -3,6 +3,7 @@
 
 #![allow(unsafe_code)]
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, Command as StdCommand, Stdio};
@@ -11,6 +12,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{embedded_runtime, ffi, nft_ruleset, procguard, rootfs};
+use serde::{Deserialize, Serialize};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
@@ -28,6 +30,17 @@ static GVPROXY_PID: AtomicI32 = AtomicI32::new(0);
 pub enum VmBackend {
     Libkrun,
     Qemu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatedPciDevice {
+    pub bdf: String,
+}
+
+impl AllocatedPciDevice {
+    pub fn validate(&self) -> Result<(), String> {
+        openshell_vfio::validate_bdf(&self.bdf).map_err(|err| err.to_string())
+    }
 }
 
 // virtio-net feature bits (see Linux `include/uapi/linux/virtio_net.h`).
@@ -64,6 +77,7 @@ pub struct VmLaunchConfig {
     pub vsock_cid: Option<u32>,
     pub guest_mac: Option<String>,
     pub gateway_port: Option<u16>,
+    pub pci_devices: Vec<AllocatedPciDevice>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -74,10 +88,6 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
 }
 
 fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    let gpu_bdf = config
-        .gpu_bdf
-        .as_deref()
-        .ok_or("gpu_bdf is required for QEMU backend")?;
     let tap_device = config
         .tap_device
         .as_deref()
@@ -97,6 +107,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .host_ip
         .as_deref()
         .ok_or("host_ip is required for QEMU backend")?;
+    let pci_device_args = qemu_pci_device_args(config)?;
 
     if !config.root_disk.is_file() {
         return Err(format!(
@@ -171,10 +182,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .arg(format!(
             "vhost-vsock-pci,guest-cid={vsock_cid},bus=vsock_root"
         ))
-        .arg("-device")
-        .arg("pcie-root-port,id=gpu_root,slot=2")
-        .arg("-device")
-        .arg(format!("vfio-pci,host={gpu_bdf},bus=gpu_root"))
+        .args(pci_device_args)
         .arg("-serial")
         .arg(format!("file:{}", config.console_output.display()));
 
@@ -245,6 +253,38 @@ fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
         ]);
     }
     args
+}
+
+fn qemu_pci_device_args(config: &VmLaunchConfig) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut seen_bdfs = HashSet::new();
+    if let Some(gpu_bdf) = config.gpu_bdf.as_deref() {
+        openshell_vfio::validate_bdf(gpu_bdf).map_err(|err| err.to_string())?;
+        seen_bdfs.insert(gpu_bdf.to_string());
+        args.extend([
+            "-device".to_string(),
+            "pcie-root-port,id=gpu_root,slot=2".to_string(),
+            "-device".to_string(),
+            format!("vfio-pci,host={gpu_bdf},bus=gpu_root"),
+        ]);
+    }
+
+    for (idx, device) in config.pci_devices.iter().enumerate() {
+        device.validate()?;
+        if !seen_bdfs.insert(device.bdf.clone()) {
+            return Err(format!("duplicate PCI device BDF: {}", device.bdf));
+        }
+        let root_id = format!("vfio_root{idx}");
+        let slot = idx + 4;
+        args.extend([
+            "-device".to_string(),
+            format!("pcie-root-port,id={root_id},slot={slot}"),
+            "-device".to_string(),
+            format!("vfio-pci,host={},bus={root_id}", device.bdf),
+        ]);
+    }
+
+    Ok(args)
 }
 
 /// Write environment variables into the overlay disk so the guest init script
@@ -1413,6 +1453,7 @@ mod tests {
             vsock_cid: Some(4),
             guest_mac: Some("02:00:00:00:00:01".to_string()),
             gateway_port: Some(8080),
+            pci_devices: Vec::new(),
         }
     }
 
@@ -1473,6 +1514,59 @@ mod tests {
             &"file=/image-rootfs.ext4,if=none,format=raw,id=image,readonly=on".to_string()
         ));
         assert!(args.contains(&"virtio-blk-pci,drive=image".to_string()));
+    }
+
+    #[test]
+    fn qemu_pci_device_args_attach_gpu_at_existing_slot() {
+        let args = qemu_pci_device_args(&qemu_config()).expect("PCI args");
+
+        assert!(args.contains(&"pcie-root-port,id=gpu_root,slot=2".to_string()));
+        assert!(args.contains(&"vfio-pci,host=0000:01:00.0,bus=gpu_root".to_string()));
+    }
+
+    #[test]
+    fn qemu_pci_device_args_attach_extension_devices_at_slots_four_plus() {
+        let mut config = qemu_config();
+        config.gpu_bdf = None;
+        config.pci_devices = vec![
+            AllocatedPciDevice {
+                bdf: "0000:02:00.0".to_string(),
+            },
+            AllocatedPciDevice {
+                bdf: "0000:03:00.0".to_string(),
+            },
+        ];
+
+        let args = qemu_pci_device_args(&config).expect("PCI args");
+
+        assert!(!args.iter().any(|arg| arg.contains("gpu_root")));
+        assert!(args.contains(&"pcie-root-port,id=vfio_root0,slot=4".to_string()));
+        assert!(args.contains(&"vfio-pci,host=0000:02:00.0,bus=vfio_root0".to_string()));
+        assert!(args.contains(&"pcie-root-port,id=vfio_root1,slot=5".to_string()));
+        assert!(args.contains(&"vfio-pci,host=0000:03:00.0,bus=vfio_root1".to_string()));
+    }
+
+    #[test]
+    fn qemu_pci_device_args_reject_invalid_bdf() {
+        let mut config = qemu_config();
+        config.gpu_bdf = None;
+        config.pci_devices = vec![AllocatedPciDevice {
+            bdf: "0000:02;00.0".to_string(),
+        }];
+
+        let err = qemu_pci_device_args(&config).expect_err("invalid BDF should fail");
+        assert!(err.contains("invalid PCI BDF address"));
+    }
+
+    #[test]
+    fn qemu_pci_device_args_reject_duplicate_bdf() {
+        let mut config = qemu_config();
+        config.pci_devices = vec![AllocatedPciDevice {
+            bdf: "0000:01:00.0".to_string(),
+        }];
+
+        let err = qemu_pci_device_args(&config).expect_err("duplicate BDF should fail");
+        assert!(err.contains("duplicate PCI device BDF"));
     }
 
     #[test]

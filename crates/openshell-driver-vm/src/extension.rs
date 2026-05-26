@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
 
-use crate::runtime::VmBackend;
+use crate::runtime::{AllocatedPciDevice, VmBackend};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchAbortReason {
@@ -68,6 +68,7 @@ pub struct VmLaunchPlan {
     pub vsock_cid: Option<u32>,
     pub guest_mac: Option<String>,
     pub gateway_port: Option<u16>,
+    pub devices: Vec<AllocatedPciDevice>,
     pub env: Vec<String>,
 }
 
@@ -312,6 +313,7 @@ mod tests {
             vsock_cid: None,
             guest_mac: None,
             gateway_port: None,
+            devices: Vec::new(),
             env: Vec::new(),
         }
     }
