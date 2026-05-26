@@ -422,9 +422,6 @@ impl VmDriver {
             "vm driver: create_sandbox received"
         );
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
-        self.validate_extension_backend_requirements(
-            sandbox.spec.as_ref().is_some_and(|spec| spec.gpu),
-        )?;
 
         let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id)?;
         let image_ref = self.resolved_sandbox_image(sandbox).ok_or_else(|| {
@@ -578,7 +575,6 @@ impl VmDriver {
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
         let is_gpu = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
-        self.validate_extension_backend_requirements(is_gpu)?;
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -647,7 +643,7 @@ impl VmDriver {
             None
         };
 
-        let needs_qemu = is_gpu;
+        let needs_qemu = is_gpu || self.lifecycle_extensions.requires_qemu();
 
         let mut plan =
             match self.build_vm_launch_plan(&sandbox.id, needs_qemu, is_gpu, gpu_bdf.clone()) {
@@ -748,6 +744,12 @@ impl VmDriver {
             }
             if let Some(port) = plan.gateway_port {
                 command.arg("--vm-gateway-port").arg(port.to_string());
+            }
+            for device in &plan.devices {
+                let encoded = serde_json::to_string(device).map_err(|err| {
+                    Status::internal(format!("serialize VM PCI device failed: {err}"))
+                })?;
+                command.arg("--vm-pci-device").arg(encoded);
             }
         }
 
@@ -1149,26 +1151,42 @@ impl VmDriver {
     }
 
     #[allow(clippy::result_large_err)]
-    fn validate_extension_backend_requirements(&self, is_gpu: bool) -> Result<(), Status> {
-        if self.lifecycle_extensions.requires_qemu() && !is_gpu {
-            return Err(Status::failed_precondition(
-                "vm lifecycle extension requires QEMU, but non-GPU QEMU launch support requires concrete PCI device transport",
-            ));
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::result_large_err)]
     fn validate_launch_plan_backend(is_gpu: bool, plan: &VmLaunchPlan) -> Result<(), Status> {
-        if plan.backend == VmBackend::Qemu && !is_gpu {
+        if plan.backend != VmBackend::Qemu && !plan.devices.is_empty() {
             return Err(Status::failed_precondition(
-                "vm lifecycle extension selected QEMU, but non-GPU QEMU launch support requires concrete PCI device transport",
+                "PCI device passthrough requires the QEMU backend",
             ));
         }
         if plan.backend != VmBackend::Qemu && is_gpu {
             return Err(Status::failed_precondition(
                 "GPU sandbox launch requires the QEMU backend",
             ));
+        }
+        if plan.backend == VmBackend::Qemu
+            && (plan.tap_device.is_none()
+                || plan.guest_ip.is_none()
+                || plan.host_ip.is_none()
+                || plan.vsock_cid.is_none()
+                || plan.guest_mac.is_none())
+        {
+            return Err(Status::failed_precondition(
+                "QEMU sandbox launch requires TAP and vsock launch fields",
+            ));
+        }
+        let mut seen_bdfs = HashSet::new();
+        if let Some(gpu_bdf) = plan.gpu_bdf.as_deref() {
+            seen_bdfs.insert(gpu_bdf.to_string());
+        }
+        for device in &plan.devices {
+            device
+                .validate()
+                .map_err(|err| Status::failed_precondition(format!("invalid PCI device: {err}")))?;
+            if !seen_bdfs.insert(device.bdf.clone()) {
+                return Err(Status::failed_precondition(format!(
+                    "duplicate PCI device BDF: {}",
+                    device.bdf
+                )));
+            }
         }
         Ok(())
     }
@@ -1204,6 +1222,7 @@ impl VmDriver {
                 vsock_cid: None,
                 guest_mac: None,
                 gateway_port: None,
+                devices: Vec::new(),
                 env: Vec::new(),
             });
         }
@@ -1240,6 +1259,7 @@ impl VmDriver {
             vsock_cid: Some(vsock_cid),
             guest_mac: Some(mac_str),
             gateway_port,
+            devices: Vec::new(),
             env: Vec::new(),
         })
     }
@@ -5951,7 +5971,7 @@ mod tests {
         VmLaunchPlan, VmLifecycleError, VmLifecycleExtension, VmLifecycleExtensions,
         VmLifecycleResult,
     };
-    use crate::runtime::VmBackend;
+    use crate::runtime::{AllocatedPciDevice, VmBackend};
 
     fn test_driver_with_extensions(extensions: VmLifecycleExtensions) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
@@ -6073,7 +6093,7 @@ mod tests {
     }
 
     #[test]
-    fn extension_requiring_qemu_rejects_non_gpu_until_pci_transport() {
+    fn extension_requiring_qemu_builds_non_gpu_qemu_plan() {
         let mut extensions = VmLifecycleExtensions::new();
         extensions.push(Arc::new(QemuRequiringExtension {
             name: "test-ext".to_string(),
@@ -6081,15 +6101,67 @@ mod tests {
         let driver = test_driver_with_extensions(extensions);
         assert!(driver.lifecycle_extensions.requires_qemu());
 
-        let err = driver
-            .validate_extension_backend_requirements(false)
-            .expect_err("non-GPU QEMU extension requests need concrete PCI transport");
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("concrete PCI device transport"));
+        let plan = driver
+            .build_vm_launch_plan("sandbox-no-gpu", true, false, None)
+            .expect("non-GPU QEMU plan should build");
 
-        driver
-            .validate_extension_backend_requirements(true)
-            .expect("GPU sandboxes already use the QEMU backend");
+        assert_eq!(plan.backend, VmBackend::Qemu);
+        assert_eq!(plan.vcpus, 2);
+        assert_eq!(plan.mem_mib, 2048);
+        assert!(plan.gpu_bdf.is_none());
+        assert!(plan.tap_device.is_some());
+        assert!(plan.guest_ip.is_some());
+        assert!(plan.host_ip.is_some());
+        assert!(plan.vsock_cid.is_some());
+        assert!(plan.guest_mac.is_some());
+    }
+
+    #[test]
+    fn qemu_launch_plan_requires_transport_fields() {
+        let plan = VmLaunchPlan {
+            backend: VmBackend::Qemu,
+            vcpus: 2,
+            mem_mib: 2048,
+            gpu_bdf: None,
+            tap_device: None,
+            guest_ip: None,
+            host_ip: None,
+            vsock_cid: None,
+            guest_mac: None,
+            gateway_port: None,
+            devices: Vec::new(),
+            env: Vec::new(),
+        };
+
+        let err = VmDriver::validate_launch_plan_backend(false, &plan)
+            .expect_err("QEMU plan without transport fields should fail");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("TAP and vsock"));
+    }
+
+    #[test]
+    fn libkrun_launch_plan_rejects_pci_devices() {
+        let plan = VmLaunchPlan {
+            backend: VmBackend::Libkrun,
+            vcpus: 2,
+            mem_mib: 2048,
+            gpu_bdf: None,
+            tap_device: None,
+            guest_ip: None,
+            host_ip: None,
+            vsock_cid: None,
+            guest_mac: None,
+            gateway_port: None,
+            devices: vec![AllocatedPciDevice {
+                bdf: "0000:02:00.0".to_string(),
+            }],
+            env: Vec::new(),
+        };
+
+        let err = VmDriver::validate_launch_plan_backend(false, &plan)
+            .expect_err("PCI devices should require QEMU");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("requires the QEMU backend"));
     }
 
     #[tokio::test]
@@ -6115,6 +6187,7 @@ mod tests {
             vsock_cid: None,
             guest_mac: None,
             gateway_port: None,
+            devices: Vec::new(),
             env: Vec::new(),
         };
         let err = extensions
@@ -6134,6 +6207,9 @@ mod tests {
             vsock_cid: Some(7),
             guest_mac: Some("02:00:00:00:00:01".to_string()),
             gateway_port: Some(8080),
+            devices: vec![AllocatedPciDevice {
+                bdf: "0000:02:00.0".to_string(),
+            }],
             env: Vec::new(),
         };
         extensions
@@ -6162,6 +6238,7 @@ mod tests {
             vsock_cid: Some(7),
             guest_mac: Some("02:00:00:00:00:01".to_string()),
             gateway_port: Some(8080),
+            devices: Vec::new(),
             env: Vec::new(),
         };
         let err = extensions

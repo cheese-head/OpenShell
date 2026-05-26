@@ -6,9 +6,11 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_driver_vm::{
+    AllocatedPciDevice, VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm,
+};
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
-use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -152,6 +154,9 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_gateway_port: Option<u16>,
+
+    #[arg(long = "vm-pci-device", hide = true)]
+    vm_pci_device: Vec<String>,
 }
 
 #[tokio::main]
@@ -477,6 +482,18 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         Some("libkrun") | None => VmBackend::Libkrun,
         Some(other) => return Err(format!("unknown VM backend: {other}")),
     };
+    let pci_devices = args
+        .vm_pci_device
+        .iter()
+        .map(|device| {
+            let parsed: AllocatedPciDevice = serde_json::from_str(device)
+                .map_err(|err| format!("invalid --vm-pci-device JSON: {err}"))?;
+            parsed
+                .validate()
+                .map_err(|err| format!("invalid --vm-pci-device bdf: {err}"))?;
+            Ok(parsed)
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
 
     Ok(VmLaunchConfig {
         root_disk,
@@ -498,6 +515,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         vsock_cid: args.vm_vsock_cid,
         guest_mac: args.vm_guest_mac.clone(),
         gateway_port: args.vm_gateway_port,
+        pci_devices,
     })
 }
 
@@ -557,7 +575,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 mod tests {
     use super::{
         Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode,
+        build_vm_launch_config, compute_driver_listen_mode,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -712,5 +730,54 @@ mod tests {
                 expected_peer_pid: None,
             }
         );
+    }
+
+    #[test]
+    fn internal_vm_config_accepts_repeated_pci_device_json() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--internal-run-vm",
+            "--vm-root-disk",
+            "/tmp/root.ext4",
+            "--vm-overlay-disk",
+            "/tmp/overlay.ext4",
+            "--vm-exec",
+            "/init",
+            "--vm-console-output",
+            "/tmp/console.log",
+            "--vm-pci-device",
+            r#"{"bdf":"0000:02:00.0"}"#,
+            "--vm-pci-device",
+            r#"{"bdf":"0000:03:00.0"}"#,
+        ]);
+
+        let config = build_vm_launch_config(&args).expect("launch config");
+
+        assert_eq!(config.pci_devices.len(), 2);
+        assert_eq!(config.pci_devices[0].bdf, "0000:02:00.0");
+        assert_eq!(config.pci_devices[1].bdf, "0000:03:00.0");
+    }
+
+    #[test]
+    fn internal_vm_config_rejects_invalid_pci_device_json() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--internal-run-vm",
+            "--vm-root-disk",
+            "/tmp/root.ext4",
+            "--vm-overlay-disk",
+            "/tmp/overlay.ext4",
+            "--vm-exec",
+            "/init",
+            "--vm-console-output",
+            "/tmp/console.log",
+            "--vm-pci-device",
+            r#"{"bdf":"0000:02;00.0"}"#,
+        ]);
+
+        let Err(err) = build_vm_launch_config(&args) else {
+            panic!("invalid BDF should fail");
+        };
+        assert!(err.contains("invalid --vm-pci-device bdf"));
     }
 }
