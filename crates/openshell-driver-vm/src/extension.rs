@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
@@ -57,6 +58,12 @@ impl std::error::Error for VmLifecycleError {}
 pub type VmLifecycleResult<T> = Result<T, VmLifecycleError>;
 
 #[derive(Debug, Clone)]
+pub struct VmPersistedSandbox {
+    pub sandbox: Sandbox,
+    pub state_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct VmLaunchPlan {
     pub backend: VmBackend,
     pub vcpus: u8,
@@ -78,6 +85,18 @@ pub trait VmLifecycleExtension: std::fmt::Debug + Send + Sync {
 
     fn required_backend(&self) -> Option<VmBackend> {
         None
+    }
+
+    async fn reconcile_before_restore(&self, _extension_state_dir: &Path) -> VmLifecycleResult<()> {
+        Ok(())
+    }
+
+    async fn reconcile_after_restore(
+        &self,
+        _extension_state_dir: &Path,
+        _sandboxes: &[VmPersistedSandbox],
+    ) -> VmLifecycleResult<()> {
+        Ok(())
     }
 
     async fn before_vm_launch(
@@ -159,6 +178,53 @@ impl VmLifecycleExtensions {
             .any(|ext| ext.required_backend() == Some(VmBackend::Qemu))
     }
 
+    pub fn state_dirs(&self, root: &Path) -> VmLifecycleResult<Vec<(String, PathBuf)>> {
+        let mut names = HashSet::new();
+        let mut dirs = Vec::with_capacity(self.extensions.len());
+        for ext in &self.extensions {
+            let name = ext.name();
+            if !names.insert(name.to_string()) {
+                return Err(VmLifecycleError::new(format!(
+                    "duplicate VM lifecycle extension name: {name}"
+                )));
+            }
+            dirs.push((name.to_string(), extension_state_dir(root, name)?));
+        }
+        Ok(dirs)
+    }
+
+    pub async fn reconcile_before_restore(&self, root: &Path) -> VmLifecycleResult<()> {
+        let state_dirs = self.state_dirs(root)?;
+        for (ext, (_, state_dir)) in self.extensions.iter().zip(state_dirs.iter()) {
+            if let Err(err) = ext.reconcile_before_restore(state_dir).await {
+                return Err(VmLifecycleError::new(format!(
+                    "{} reconcile_before_restore failed: {}",
+                    ext.name(),
+                    err.message()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn reconcile_after_restore(
+        &self,
+        root: &Path,
+        sandboxes: &[VmPersistedSandbox],
+    ) -> VmLifecycleResult<()> {
+        let state_dirs = self.state_dirs(root)?;
+        for (ext, (_, state_dir)) in self.extensions.iter().zip(state_dirs.iter()) {
+            if let Err(err) = ext.reconcile_after_restore(state_dir, sandboxes).await {
+                return Err(VmLifecycleError::new(format!(
+                    "{} reconcile_after_restore failed: {}",
+                    ext.name(),
+                    err.message()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn before_vm_launch(
         &self,
         sandbox: &Sandbox,
@@ -206,6 +272,21 @@ impl VmLifecycleExtensions {
     }
 }
 
+fn extension_state_dir(root: &Path, name: &str) -> VmLifecycleResult<PathBuf> {
+    let valid = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+    if !valid {
+        return Err(VmLifecycleError::new(format!(
+            "invalid VM lifecycle extension name: {name:?}"
+        )));
+    }
+    Ok(root.join(name))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -218,6 +299,8 @@ mod tests {
         name: String,
         backend: Option<VmBackend>,
         before_should_fail: bool,
+        reconcile_before_should_fail: bool,
+        reconcile_after_should_fail: bool,
         calls: Mutex<Vec<String>>,
     }
 
@@ -227,6 +310,8 @@ mod tests {
                 name: name.to_string(),
                 backend,
                 before_should_fail: false,
+                reconcile_before_should_fail: false,
+                reconcile_after_should_fail: false,
                 calls: Mutex::new(Vec::new()),
             })
         }
@@ -236,6 +321,30 @@ mod tests {
                 name: name.to_string(),
                 backend,
                 before_should_fail: true,
+                reconcile_before_should_fail: false,
+                reconcile_after_should_fail: false,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn failing_reconcile_before(name: &str) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                backend: None,
+                before_should_fail: false,
+                reconcile_before_should_fail: true,
+                reconcile_after_should_fail: false,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn failing_reconcile_after(name: &str) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                backend: None,
+                before_should_fail: false,
+                reconcile_before_should_fail: false,
+                reconcile_after_should_fail: true,
                 calls: Mutex::new(Vec::new()),
             })
         }
@@ -253,6 +362,44 @@ mod tests {
 
         fn required_backend(&self) -> Option<VmBackend> {
             self.backend.clone()
+        }
+
+        async fn reconcile_before_restore(
+            &self,
+            extension_state_dir: &Path,
+        ) -> VmLifecycleResult<()> {
+            self.calls.lock().unwrap().push(format!(
+                "{}:reconcile_before_restore:{}",
+                self.name,
+                extension_state_dir.file_name().unwrap().to_string_lossy()
+            ));
+            if self.reconcile_before_should_fail {
+                return Err(VmLifecycleError::new(format!(
+                    "{}: scripted reconcile_before_restore failure",
+                    self.name
+                )));
+            }
+            Ok(())
+        }
+
+        async fn reconcile_after_restore(
+            &self,
+            extension_state_dir: &Path,
+            sandboxes: &[VmPersistedSandbox],
+        ) -> VmLifecycleResult<()> {
+            self.calls.lock().unwrap().push(format!(
+                "{}:reconcile_after_restore:{}:{}",
+                self.name,
+                extension_state_dir.file_name().unwrap().to_string_lossy(),
+                sandboxes.len()
+            ));
+            if self.reconcile_after_should_fail {
+                return Err(VmLifecycleError::new(format!(
+                    "{}: scripted reconcile_after_restore failure",
+                    self.name
+                )));
+            }
+            Ok(())
         }
 
         async fn before_vm_launch(
@@ -326,6 +473,13 @@ mod tests {
         }
     }
 
+    fn sample_persisted_sandbox() -> VmPersistedSandbox {
+        VmPersistedSandbox {
+            sandbox: sample_sandbox(),
+            state_dir: PathBuf::from("/tmp/state/sandbox-123"),
+        }
+    }
+
     fn as_extension<T>(extension: &Arc<T>) -> Arc<dyn VmLifecycleExtension>
     where
         T: VmLifecycleExtension + 'static,
@@ -354,6 +508,100 @@ mod tests {
         registry.push(RecordingExtension::new("noop1", None));
         registry.push(RecordingExtension::new("noop2", Some(VmBackend::Libkrun)));
         assert!(!registry.requires_qemu());
+    }
+
+    #[test]
+    fn state_dirs_reject_duplicate_or_unsafe_extension_names() {
+        let duplicate = VmLifecycleExtensions::with(vec![
+            RecordingExtension::new("dup", None),
+            RecordingExtension::new("dup", None),
+        ]);
+        assert!(duplicate.state_dirs(Path::new("/tmp/ext")).is_err());
+
+        let unsafe_name =
+            VmLifecycleExtensions::with(vec![RecordingExtension::new("../escape", None)]);
+        assert!(unsafe_name.state_dirs(Path::new("/tmp/ext")).is_err());
+    }
+
+    #[tokio::test]
+    async fn reconcile_before_restore_runs_each_extension_in_order() {
+        let ext_a = RecordingExtension::new("a", None);
+        let ext_b = RecordingExtension::new("b", None);
+        let registry =
+            VmLifecycleExtensions::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
+
+        registry
+            .reconcile_before_restore(Path::new("/tmp/extensions"))
+            .await
+            .expect("reconcile_before_restore succeeds");
+
+        assert_eq!(ext_a.calls(), vec!["a:reconcile_before_restore:a"]);
+        assert_eq!(ext_b.calls(), vec!["b:reconcile_before_restore:b"]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_after_restore_runs_each_extension_in_order() {
+        let ext_a = RecordingExtension::new("a", None);
+        let ext_b = RecordingExtension::new("b", None);
+        let registry =
+            VmLifecycleExtensions::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
+        let persisted = vec![sample_persisted_sandbox()];
+
+        registry
+            .reconcile_after_restore(Path::new("/tmp/extensions"), &persisted)
+            .await
+            .expect("reconcile_after_restore succeeds");
+
+        assert_eq!(ext_a.calls(), vec!["a:reconcile_after_restore:a:1"]);
+        assert_eq!(ext_b.calls(), vec!["b:reconcile_after_restore:b:1"]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_restore_failures_short_circuit() {
+        let ext_a = RecordingExtension::new("a", None);
+        let ext_fail = RecordingExtension::failing_reconcile_before("boom");
+        let ext_c = RecordingExtension::new("c", None);
+        let registry = VmLifecycleExtensions::with(vec![
+            as_extension(&ext_a),
+            as_extension(&ext_fail),
+            as_extension(&ext_c),
+        ]);
+
+        let err = registry
+            .reconcile_before_restore(Path::new("/tmp/extensions"))
+            .await
+            .expect_err("scripted failure should propagate");
+
+        assert!(err.message().contains("reconcile_before_restore failed"));
+        assert_eq!(ext_a.calls(), vec!["a:reconcile_before_restore:a"]);
+        assert_eq!(ext_fail.calls(), vec!["boom:reconcile_before_restore:boom"]);
+        assert!(ext_c.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_after_restore_failures_short_circuit() {
+        let ext_a = RecordingExtension::new("a", None);
+        let ext_fail = RecordingExtension::failing_reconcile_after("boom");
+        let ext_c = RecordingExtension::new("c", None);
+        let registry = VmLifecycleExtensions::with(vec![
+            as_extension(&ext_a),
+            as_extension(&ext_fail),
+            as_extension(&ext_c),
+        ]);
+        let persisted = vec![sample_persisted_sandbox()];
+
+        let err = registry
+            .reconcile_after_restore(Path::new("/tmp/extensions"), &persisted)
+            .await
+            .expect_err("scripted failure should propagate");
+
+        assert!(err.message().contains("reconcile_after_restore failed"));
+        assert_eq!(ext_a.calls(), vec!["a:reconcile_after_restore:a:1"]);
+        assert_eq!(
+            ext_fail.calls(),
+            vec!["boom:reconcile_after_restore:boom:1"]
+        );
+        assert!(ext_c.calls().is_empty());
     }
 
     #[tokio::test]

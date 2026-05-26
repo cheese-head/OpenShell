@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::extension::{LaunchAbortReason, VmLaunchPlan, VmLifecycleExtensions};
+use crate::extension::{
+    LaunchAbortReason, VmLaunchPlan, VmLifecycleExtensions, VmPersistedSandbox,
+};
 use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
@@ -343,6 +345,26 @@ impl VmDriver {
                     image_cache_root.display()
                 )
             })?;
+        let lifecycle_extensions_root = lifecycle_extensions_root_dir(&config.state_dir);
+        create_private_dir_all(&lifecycle_extensions_root)
+            .await
+            .map_err(|err| {
+                format!(
+                    "failed to create lifecycle extension state dir '{}': {err}",
+                    lifecycle_extensions_root.display()
+                )
+            })?;
+        for (name, state_dir) in lifecycle_extensions
+            .state_dirs(&lifecycle_extensions_root)
+            .map_err(|err| err.message().to_string())?
+        {
+            create_private_dir_all(&state_dir).await.map_err(|err| {
+                format!(
+                    "failed to create lifecycle extension state dir for '{name}' at '{}': {err}",
+                    state_dir.display()
+                )
+            })?;
+        }
 
         let launcher_bin = if let Some(path) = config.launcher_bin.clone() {
             path
@@ -379,7 +401,7 @@ impl VmDriver {
             subnet_allocator,
             lifecycle_extensions: Arc::new(lifecycle_extensions),
         };
-        driver.restore_persisted_sandboxes().await;
+        driver.restore_persisted_sandboxes().await?;
         Ok(driver)
     }
 
@@ -969,21 +991,43 @@ impl VmDriver {
         snapshots
     }
 
-    async fn restore_persisted_sandboxes(&self) {
+    async fn restore_persisted_sandboxes(&self) -> Result<(), String> {
+        let lifecycle_extensions_root = lifecycle_extensions_root_dir(&self.config.state_dir);
+        self.lifecycle_extensions
+            .reconcile_before_restore(&lifecycle_extensions_root)
+            .await
+            .map_err(|err| err.message().to_string())?;
+
+        let persisted_sandboxes = self.scan_persisted_sandboxes().await;
+        self.lifecycle_extensions
+            .reconcile_after_restore(&lifecycle_extensions_root, &persisted_sandboxes)
+            .await
+            .map_err(|err| err.message().to_string())?;
+
+        for persisted in persisted_sandboxes {
+            self.restore_persisted_sandbox(persisted.sandbox, persisted.state_dir)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    async fn scan_persisted_sandboxes(&self) -> Vec<VmPersistedSandbox> {
         let state_root = sandboxes_root_dir(&self.config.state_dir);
         let mut entries = match tokio::fs::read_dir(&state_root).await {
             Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
             Err(err) => {
                 warn!(
                     state_root = %state_root.display(),
                     error = %err,
                     "vm driver: failed to scan persisted sandboxes"
                 );
-                return;
+                return Vec::new();
             }
         };
 
+        let mut sandboxes = Vec::new();
         loop {
             let entry = match entries.next_entry().await {
                 Ok(Some(entry)) => entry,
@@ -1039,8 +1083,9 @@ impl VmDriver {
                 continue;
             }
 
-            self.restore_persisted_sandbox(sandbox, state_dir).await;
+            sandboxes.push(VmPersistedSandbox { sandbox, state_dir });
         }
+        sandboxes
     }
 
     async fn restore_persisted_sandbox(&self, sandbox: Sandbox, state_dir: PathBuf) {
@@ -3728,6 +3773,10 @@ fn sandboxes_root_dir(root: &Path) -> PathBuf {
     root.join("sandboxes")
 }
 
+fn lifecycle_extensions_root_dir(root: &Path) -> PathBuf {
+    root.join("extensions")
+}
+
 async fn create_private_dir_all(path: &Path) -> Result<(), std::io::Error> {
     tokio::fs::create_dir_all(path).await?;
     restrict_owner_only_dir(path).await
@@ -6045,6 +6094,123 @@ mod tests {
         ) -> VmLifecycleResult<()> {
             Err(VmLifecycleError::resource_exhausted("pool empty"))
         }
+    }
+
+    #[derive(Debug)]
+    struct StartupReconcileExtension {
+        name: String,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+        fail_before: bool,
+    }
+
+    impl StartupReconcileExtension {
+        fn recording(name: &str) -> (Arc<Self>, Arc<std::sync::Mutex<Vec<String>>>) {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    name: name.to_string(),
+                    calls: calls.clone(),
+                    fail_before: false,
+                }),
+                calls,
+            )
+        }
+
+        fn failing_before(name: &str) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_before: true,
+            })
+        }
+    }
+
+    #[tonic::async_trait]
+    impl VmLifecycleExtension for StartupReconcileExtension {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn reconcile_before_restore(
+            &self,
+            extension_state_dir: &Path,
+        ) -> VmLifecycleResult<()> {
+            self.calls.lock().unwrap().push(format!(
+                "before:{}",
+                extension_state_dir.file_name().unwrap().to_string_lossy()
+            ));
+            if self.fail_before {
+                return Err(VmLifecycleError::new("scripted startup reconcile failure"));
+            }
+            Ok(())
+        }
+
+        async fn reconcile_after_restore(
+            &self,
+            extension_state_dir: &Path,
+            sandboxes: &[VmPersistedSandbox],
+        ) -> VmLifecycleResult<()> {
+            self.calls.lock().unwrap().push(format!(
+                "after:{}:{}",
+                extension_state_dir.file_name().unwrap().to_string_lossy(),
+                sandboxes.len()
+            ));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn new_with_extensions_creates_extension_state_dirs_and_reconciles_persisted_sandboxes() {
+        let base = unique_temp_dir();
+        let state_dir = base.join("sandboxes").join("sandbox-123");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            ..Default::default()
+        };
+        write_sandbox_request(&state_dir, &sandbox)
+            .await
+            .expect("write sandbox request");
+        let (extension, calls) = StartupReconcileExtension::recording("vfio");
+        let extensions = VmLifecycleExtensions::with(vec![extension]);
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            state_dir: base.clone(),
+            ..Default::default()
+        };
+
+        let _driver = VmDriver::new_with_extensions(config, extensions)
+            .await
+            .expect("driver startup should reconcile extensions");
+
+        assert!(base.join("extensions").join("vfio").is_dir());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["before:vfio", "after:vfio:1"]
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn new_with_extensions_fails_when_reconcile_before_restore_fails() {
+        let base = unique_temp_dir();
+        let extensions =
+            VmLifecycleExtensions::with(vec![StartupReconcileExtension::failing_before("vfio")]);
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            state_dir: base.clone(),
+            ..Default::default()
+        };
+
+        let Err(err) = VmDriver::new_with_extensions(config, extensions).await else {
+            panic!("driver startup should fail")
+        };
+
+        assert!(err.contains("reconcile_before_restore failed"));
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

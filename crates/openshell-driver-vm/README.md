@@ -139,7 +139,7 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | Configuration key | Default | Purpose |
 |---|---|---|
 | `grpc_endpoint` | empty | Required. URL the sandbox guest dials to reach the gateway. Use `http://host.containers.internal:<port>` (or `host.docker.internal` / `host.openshell.internal`) so traffic flows through gvproxy's host-loopback NAT (HostIP `192.168.127.254` → host `127.0.0.1`). Loopback URLs like `http://127.0.0.1:<port>` are rewritten automatically by the driver. The bare gateway IP (`192.168.127.1`) only carries gvproxy's own services and will not reach host-bound ports. |
-| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. |
+| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, extension state, console logs, image cache, and private `run/compute-driver.sock` UDS. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
 | `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Defaults to the sandbox image when unset. |
@@ -191,7 +191,8 @@ during the first prepare.
 
 The driver also writes the accepted `DriverSandbox` launch request to
 `<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a
-new VM driver process; that process scans the sandbox state directories,
+new VM driver process; that process lets lifecycle extensions reconcile their
+`<state-dir>/extensions/<name>` state, scans the sandbox state directories,
 restarts each persisted VM launcher, and preserves any existing `overlay.ext4`
 instead of cloning a fresh overlay template. If a restart happened before the
 overlay was created, the driver creates it during the resume attempt.

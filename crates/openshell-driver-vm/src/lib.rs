@@ -14,7 +14,7 @@ mod runtime;
 pub use driver::{VmDriver, VmDriverConfig};
 pub use extension::{
     LaunchAbortReason, VmLaunchPlan, VmLifecycleError, VmLifecycleExtension, VmLifecycleExtensions,
-    VmLifecycleResult,
+    VmLifecycleResult, VmPersistedSandbox,
 };
 pub use runtime::{
     AllocatedPciDevice, VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig,
