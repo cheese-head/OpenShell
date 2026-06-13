@@ -450,11 +450,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bf-flow"
+version = "0.0.0"
+
+[[package]]
 name = "bf-inventory"
 version = "0.0.0"
 dependencies = [
  "bf-core",
  "openshell-vfio",
+]
+
+[[package]]
+name = "bf-switch"
+version = "0.0.0"
+dependencies = [
+ "bf-flow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
